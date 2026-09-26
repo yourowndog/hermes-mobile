@@ -513,6 +513,36 @@ class ChatViewModel(
     private var resumedGeneration = -1L
     private var hydratedGeneration = -1L
 
+    /**
+     * Profile name captured from the most recent
+     * [ProfileSwitchCoordinator.switched] event. Passed to
+     * [ProfileSwitchCoordinator.consumeCanonicalIntent] in
+     * [handleGatewayReady] — instead of reading [AuthManager.activeProfileId]
+     * globally — so a late [gateway.ready] from an older switch cannot
+     * consume a newer switch's intent.
+     *
+     * Set by the [switched] collector (which fires before the socket
+     * re-dial) and cleared after one consumption attempt in
+     * [handleGatewayReady].
+     */
+    private var pendingSwitchProfile: String? = null
+    private var pendingSwitchGeneration: Long = 0L
+
+    /**
+     * True while a switch-profile cycle is in-flight (switched event captured,
+     * disconnect+connect pending). Set by the [switched] event collector and
+     * cleared by [handleGatewayReady] after the consumption attempt.
+     *
+     * The [DISCONNECTED] status collector uses this to distinguish an
+     * INTENTIONAL disconnect inside [ProfileSwitchCoordinator.switchProfile]
+     * from an UNINTENTIONAL network drop. During an intentional switch, the
+     * pending switch token must survive the disconnect so that the subsequent
+     * [gateway.ready] can consume the canonical intent. On an unintentional
+     * drop the token is invalidated because the next connection was not
+     * produced by the intended switch.
+     */
+    private var switchInProgress = false
+
     /** Runtime TUI session returned by session.resume; Desktop storage keeps the original ID. */
     private var runtimeSessionId: String? = null
 
@@ -813,6 +843,20 @@ class ChatViewModel(
                     // Fail any in-flight awaited RPCs so callers don't hang
                     // across the disconnect (delegated to HermesWsClient, issue #526).
                     wsClient.rejectAllPending()
+                    // When a switch-profile is NOT in flight, invalidate any
+                    // pending switch token captured from a previous switched
+                    // event — the new gateway.ready will either be for a
+                    // fresh reconnect (no intent to consume) or for a new
+                    // switch that sets a fresh token. During an intentional
+                    // switch (switchInProgress == true), the pending token
+                    // MUST survive the disconnect: the switchProfile flow
+                    // goes switched → disconnect → connect → gateway.ready,
+                    // and the token is consumed by handleGatewayReady for
+                    // the reconnect's gateway.ready, not here.
+                    if (!switchInProgress) {
+                        pendingSwitchProfile = null
+                        pendingSwitchGeneration = 0L
+                    }
                 }
             }
         }
@@ -823,10 +867,19 @@ class ChatViewModel(
         // previous profile's context never leaks into the new profile's chat.
         viewModelScope.launch {
             ProfileSwitchCoordinator.switched
-                .collect { _ ->
+                .collect { payload ->
                     pendingGoneSessionNotice = false
                     sessionHasServerPresence = false
                     resetSessionState(sessionId = null, title = "Hermes", isLoading = true)
+                    // Capture the switch identity from the immutable payload
+                    // rather than reading the mutable activeSwitchGeneration
+                    // field, which a concurrent second switch may have already
+                    // overwritten. The payload's ownerToken is from the same
+                    // generation counter that scopes the canonical intent, so
+                    // handleGatewayReady can match it against the intent.
+                    pendingSwitchProfile = payload.profileName
+                    pendingSwitchGeneration = payload.ownerToken
+                    switchInProgress = true
                 }
         }
         // Same wipe when the CONNECTION profile changes (different server):
@@ -839,6 +892,13 @@ class ChatViewModel(
                     pendingGoneSessionNotice = false
                     sessionHasServerPresence = false
                     resetSessionState(sessionId = null, title = "Hermes", isLoading = true)
+                    // A connection profile switch does not carry a canonical
+                    // session intent — every connection switch creates a fresh
+                    // session. Clear any stale profile-switch intent captured
+                    // before this connection-level re-home.
+                    pendingSwitchProfile = null
+                    pendingSwitchGeneration = 0L
+                    switchInProgress = false
                 }
         }
         // Slash-command usage ranking (issue #865): mirror the local usage
@@ -935,18 +995,27 @@ class ChatViewModel(
                 switchSession(initial)
             } else {
                 // Consume canonical-session intent from a Bot Chat profile
-                // switch, but only when the profile matches the current active
-                // profile. Prevents cross-profile consumption and stale intents
-                // from failed or cancelled switches.
-                val activeProfile = AuthManager.activeProfileId.value
-                val intentGeneration = ProfileSwitchCoordinator.canonicalIntentGeneration
+                // switch. Use the captured pending switch token instead of
+                // AuthManager.activeProfileId + a global latest-success
+                // generation, so a late gateway.ready from switch A cannot
+                // consume switch B's intent (the pending token is set by the
+                // switched collector when the switch event is observed, and
+                // the coordinator validates that the intent generation
+                // matches the active switch generation internally).
+                val pendingProfile = pendingSwitchProfile
+                val pendingGen = pendingSwitchGeneration
+                pendingSwitchProfile = null
+                pendingSwitchGeneration = 0L
+                switchInProgress = false
                 val canonicalSessionId =
-                    if (activeProfile != null) {
+                    if (pendingProfile != null && pendingGen > 0L) {
                         ProfileSwitchCoordinator.consumeCanonicalIntent(
-                            activeProfile,
-                            intentGeneration,
+                            pendingProfile,
+                            expectedGeneration = pendingGen,
                         )
-                    } else null
+                    } else {
+                        null
+                    }
                 if (!canonicalSessionId.isNullOrBlank()) {
                     switchSession(canonicalSessionId)
                 } else if (AuthManager.isRestoreLastSession()) {

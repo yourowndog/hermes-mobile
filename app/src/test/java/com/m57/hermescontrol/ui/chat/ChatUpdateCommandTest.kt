@@ -8,6 +8,7 @@ import com.m57.hermescontrol.data.model.ActionResponse
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.remote.HermesApiService
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
+import com.m57.hermescontrol.data.session.SwitchedPayload
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsEvent
@@ -127,7 +128,7 @@ class ChatUpdateCommandTest {
         // ChatViewModelTest: stub the flow with a never-emitting mock so the
         // collectors park harmlessly.
         mockkObject(ProfileSwitchCoordinator)
-        every { ProfileSwitchCoordinator.switched } returns MutableSharedFlow<String>()
+        every { ProfileSwitchCoordinator.switched } returns MutableSharedFlow<SwitchedPayload>()
         every { ProfileSwitchCoordinator.connectionSwitched } returns MutableSharedFlow<String>()
 
         every { HermesWsClient.send(any(), any(), any()) } answers {

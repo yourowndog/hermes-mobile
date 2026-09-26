@@ -8,6 +8,7 @@ import com.m57.hermescontrol.data.model.PaginationInfo
 import com.m57.hermescontrol.data.model.SessionMessagesResponse
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
+import com.m57.hermescontrol.data.session.SwitchedPayload
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsEvent
@@ -97,7 +98,7 @@ class SlashCommandDispatchRpcTest {
         // CI flakes). Stub it with a never-emitting mock flow (ChatViewModelTest
         // pattern) so the collectors park harmlessly.
         mockkObject(ProfileSwitchCoordinator)
-        every { ProfileSwitchCoordinator.switched } returns MutableSharedFlow<String>()
+        every { ProfileSwitchCoordinator.switched } returns MutableSharedFlow<SwitchedPayload>()
         every { ProfileSwitchCoordinator.connectionSwitched } returns MutableSharedFlow<String>()
 
         app = mockk(relaxed = true)

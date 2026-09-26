@@ -400,20 +400,38 @@ fun BotsScreen(
                                                             val canonicalId =
                                                                 bot.canonical_session?.resolved_id
                                                                     ?: bot.canonical_session?.id
-                                                            if (!canonicalId.isNullOrBlank()) {
+                                                            val switchToken =
+                                                                if (!canonicalId.isNullOrBlank()) {
+                                                                    ProfileSwitchCoordinator
+                                                                        .setCanonicalIntent(
+                                                                            canonicalId,
+                                                                            bot.name,
+                                                                        )
+                                                                } else {
+                                                                    0L
+                                                                }
+                                                            try {
+                                                                val success = viewModel.selectBot(bot, switchToken)
+                                                                if (!success) {
+                                                                    // Switch failed — clear intent by
+                                                                    // token so a stale gateway.ready
+                                                                    // cannot resume it under the wrong
+                                                                    // profile, and so an older switch's
+                                                                    // failure cannot erase a newer intent.
+                                                                    ProfileSwitchCoordinator
+                                                                        .clearCanonicalIntent(switchToken)
+                                                                    return@launch
+                                                                }
+                                                            } catch (e: kotlinx.coroutines.CancellationException) {
+                                                                // Coroutine cancellation must
+                                                                // also clean up the intent so a
+                                                                // stale ready handler can't
+                                                                // consume it. Re-throw so the
+                                                                // coroutine machinery knows we
+                                                                // were cancelled.
                                                                 ProfileSwitchCoordinator
-                                                                    .setCanonicalIntent(
-                                                                        canonicalId,
-                                                                        bot.name,
-                                                                    )
-                                                            }
-                                                            val success = viewModel.selectBot(bot)
-                                                            if (!success) {
-                                                                // Switch failed — clear intent so
-                                                                // stale gateway.ready cannot resume it.
-                                                                ProfileSwitchCoordinator
-                                                                    .clearCanonicalIntent()
-                                                                return@launch
+                                                                    .clearCanonicalIntent(switchToken)
+                                                                throw e
                                                             }
                                                             if (!canonicalId.isNullOrBlank()) {
                                                                 // Register canonical session→profile mapping so proactive
@@ -450,20 +468,38 @@ fun BotsScreen(
                                                         val canonicalId =
                                                             profile.canonical_session?.resolved_id
                                                                 ?: profile.canonical_session?.id
-                                                        if (!canonicalId.isNullOrBlank()) {
+                                                        val switchToken =
+                                                            if (!canonicalId.isNullOrBlank()) {
+                                                                ProfileSwitchCoordinator
+                                                                    .setCanonicalIntent(
+                                                                        canonicalId,
+                                                                        profile.name,
+                                                                    )
+                                                            } else {
+                                                                0L
+                                                            }
+                                                        try {
+                                                            val success = viewModel.selectBot(profile, switchToken)
+                                                            if (!success) {
+                                                                // Switch failed — clear intent by
+                                                                // token so a stale gateway.ready
+                                                                // cannot resume it under the wrong
+                                                                // profile, and so an older switch's
+                                                                // failure cannot erase a newer intent.
+                                                                ProfileSwitchCoordinator
+                                                                    .clearCanonicalIntent(switchToken)
+                                                                return@launch
+                                                            }
+                                                        } catch (e: kotlinx.coroutines.CancellationException) {
+                                                            // Coroutine cancellation must
+                                                            // also clean up the intent so a
+                                                            // stale ready handler can't
+                                                            // consume it. Re-throw so the
+                                                            // coroutine machinery knows we
+                                                            // were cancelled.
                                                             ProfileSwitchCoordinator
-                                                                .setCanonicalIntent(
-                                                                    canonicalId,
-                                                                    profile.name,
-                                                                )
-                                                        }
-                                                        val success = viewModel.selectBot(profile)
-                                                        if (!success) {
-                                                            // Switch failed — clear intent so
-                                                            // stale gateway.ready cannot resume it.
-                                                            ProfileSwitchCoordinator
-                                                                .clearCanonicalIntent()
-                                                            return@launch
+                                                                .clearCanonicalIntent(switchToken)
+                                                            throw e
                                                         }
                                                         if (!canonicalId.isNullOrBlank()) {
                                                             com.m57.hermescontrol.data.session.SessionProfileTracker

@@ -12,8 +12,10 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
-/**
+/*
  * The single flow that performs a profile switch — the mobile equivalent of
  * desktop's re-home (``requestFreshSession`` + socket swap). Every surface
  * that switches profiles goes through here, so the switch is atomic instead
@@ -46,6 +48,25 @@ data class CanonicalSessionIntent(
     val generation: Long,
 )
 
+/**
+ * Immutable payload emitted on every profile switch.
+ *
+ * Carries the profile name and a monotonically increasing owner token that
+ * uniquely identifies this switch call. Together these let consumers (e.g.
+ * [ChatViewModel]) match a [WsEvent.GatewayReady] back to the exact switch
+ * that triggered the reconnect, without reading a shared mutable field that
+ * a concurrent second switch could have overwritten.
+ *
+ * The [ownerToken] derives from the same generation counter that scopes the
+ * canonical-session intent, so a consumer that holds both the payload and
+ * the canonical intent generation can verify they belong to the same logical
+ * switch without reading a shared mutable field.
+ */
+data class SwitchedPayload(
+    val profileName: String,
+    val ownerToken: Long,
+)
+
 object ProfileSwitchCoordinator {
     /**
      * Dispatcher for the blocking network hops below.
@@ -59,17 +80,36 @@ object ProfileSwitchCoordinator {
      */
     internal var ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 
-    private val _switched = MutableSharedFlow<String>(extraBufferCapacity = 1)
-    val switched: SharedFlow<String> = _switched.asSharedFlow()
+    private val _switched = MutableSharedFlow<SwitchedPayload>(extraBufferCapacity = 1)
+    val switched: SharedFlow<SwitchedPayload> = _switched.asSharedFlow()
 
     private val _connectionSwitched = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val connectionSwitched: SharedFlow<String> = _connectionSwitched.asSharedFlow()
 
     // ── Canonical-session intent (profile- and generation-scoped) ─────
 
+    /**
+     * Atomic reference holding the pending canonical-session intent.
+     * Compare-and-swap guarantees one-shot consumption — only one consumer
+     * can atomically clear and win the session id.
+     */
+    private val pendingCanonicalIntent = AtomicReference<CanonicalSessionIntent?>(null)
+
+    /**
+     * Monotonic generation counter for switch tokens. Thread-safe via
+     * AtomicLong (not read-modify-write race on volatile Long).
+     */
+    private val nextSwitchGeneration = AtomicLong(0L)
+
+    /**
+     * The generation token of the most recent successful [switchProfile] call.
+     * Read by [ChatViewModel] during the [switched] event collector, set here
+     * BEFORE the event is emitted so the collector captures the correct token.
+     * Zero when there is no active switch.
+     */
     @Volatile
-    private var pendingCanonicalIntent: CanonicalSessionIntent? = null
-    private var nextSwitchGeneration = 0L
+    internal var activeSwitchGeneration: Long = 0L
+        private set
 
     /**
      * Set a canonical-session intent scoped to [profileName]. Returns the
@@ -80,29 +120,90 @@ object ProfileSwitchCoordinator {
      * gateway.ready. Clear the intent with [clearCanonicalIntent] if the
      * switch fails or is cancelled.
      */
-    fun setCanonicalIntent(sessionId: String, profileName: String): Long {
-        val generation = ++nextSwitchGeneration
-        pendingCanonicalIntent = CanonicalSessionIntent(sessionId, profileName, generation)
+    fun setCanonicalIntent(
+        sessionId: String,
+        profileName: String,
+    ): Long {
+        val generation = nextSwitchGeneration.incrementAndGet()
+        pendingCanonicalIntent.set(CanonicalSessionIntent(sessionId, profileName, generation))
         return generation
     }
 
     /**
-     * Consume and return the intent's sessionId only when [profileName] and
-     * [generation] match the pending intent. Returns null on mismatch or when
-     * no intent is set.
+     * Consume the pending canonical-session intent, atomically one-shot.
+     *
+     * Validates that [profileName] matches the intent AND that the intent's
+     * generation matches [expectedGeneration] (when > 0) OR the global
+     * [activeSwitchGeneration] (when [expectedGeneration] is 0). This ensures
+     * that only the intent for the switch that actually produced the current
+     * WebSocket connection can be consumed — a late [gateway.ready] from an
+     * older switch cannot consume a newer intent or resume the wrong session.
+     *
+     * When called from [ChatViewModel.handleGatewayReady], pass the
+     * [pendingSwitchGeneration] captured from the [switched] event collector
+     * as [expectedGeneration] — this binds the validation to the ACTUAL
+     * switch that produced the connection, not the latest global winner.
+     *
+     * Uses AtomicReference.compareAndSet for atomic one-shot consumption:
+     * duplicate concurrent calls race on CAS and only one wins.
+     *
+     * If the pending intent is stale (generation < expectedGeneration or
+     * activeSwitchGeneration), it is atomically cleared so it does not keep
+     * matching future consumers.
+     *
+     * Returns the session id on success, null on mismatch or no intent.
      */
-    fun consumeCanonicalIntent(profileName: String, generation: Long): String? {
-        val intent = pendingCanonicalIntent
-        if (intent != null && intent.profileName == profileName && intent.generation == generation) {
-            pendingCanonicalIntent = null
-            return intent.sessionId
+    fun consumeCanonicalIntent(
+        profileName: String,
+        expectedGeneration: Long = 0L,
+    ): String? {
+        while (true) {
+            val intent = pendingCanonicalIntent.get() ?: return null
+            val activeGen =
+                expectedGeneration.takeIf { it > 0L } ?: activeSwitchGeneration
+            if (activeGen <= 0L) return null
+
+            if (intent.profileName == profileName && intent.generation == activeGen) {
+                if (pendingCanonicalIntent.compareAndSet(intent, null)) {
+                    activeSwitchGeneration = 0L
+                    return intent.sessionId
+                }
+                // CAS failed — another consumer won; retry
+                continue
+            }
+            // Stale intent (older than active switch) — clear so it can't
+            // keep blocking consumption of a future intent.
+            if (intent.generation < activeGen) {
+                pendingCanonicalIntent.compareAndSet(intent, null)
+            }
+            return null
         }
-        return null
     }
 
     /** Atomically clear any pending canonical intent. */
     fun clearCanonicalIntent() {
-        pendingCanonicalIntent = null
+        pendingCanonicalIntent.set(null)
+    }
+
+    /**
+     * Clear the pending canonical intent only when its generation matches
+     * [token]. Used by BotsScreen failure/cancellation cleanup to avoid
+     * clearing a newer switch's intent.
+     */
+    fun clearCanonicalIntent(token: Long) {
+        if (token > 0L) {
+            val intent = pendingCanonicalIntent.get()
+            if (intent != null && intent.generation == token) {
+                pendingCanonicalIntent.compareAndSet(intent, null)
+            }
+        } else {
+            pendingCanonicalIntent.set(null)
+        }
+    }
+
+    /** Test-only: set activeSwitchGeneration for deterministic test setup. */
+    internal fun testSetActiveSwitchGeneration(generation: Long) {
+        activeSwitchGeneration = generation
     }
 
     /**
@@ -110,7 +211,7 @@ object ProfileSwitchCoordinator {
      * no intent has ever been set. Consumers pass this to [consumeCanonicalIntent]
      * so that only the latest intent can be consumed.
      */
-    val canonicalIntentGeneration: Long get() = nextSwitchGeneration
+    val canonicalIntentGeneration: Long get() = nextSwitchGeneration.get()
 
     // ── Profile switch operations ────────────────────────────────────
 
@@ -128,7 +229,9 @@ object ProfileSwitchCoordinator {
      * state before writing so startup never clobbers an explicit user switch.
      */
     suspend fun restoreActiveProfileScopeIfMissing(): String? {
-        AuthManager.activeProfileId.value?.takeIf { it.isNotBlank() }?.let { return it }
+        AuthManager.activeProfileId.value
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
 
         val result =
             withContext(ioDispatcher) {
@@ -146,7 +249,30 @@ object ProfileSwitchCoordinator {
         return AuthManager.activeProfileId.value
     }
 
-    suspend fun switchProfile(name: String): NetworkResult<Unit> {
+    /**
+     * Switch the active Hermes profile (bot/agent profile).
+     *
+     * On REST success, binds the active switch generation to [ownerToken]
+     * (when > 0) or the pending intent's token (when 0), so that
+     * [consumeCanonicalIntent] can validate it after the socket re-dial
+     * delivers [gateway.ready]. On REST failure, clears only the intent
+     * owned by the captured token.
+     *
+     * Callers that already have an immutable owner token from
+     * [setCanonicalIntent] MUST pass it as [ownerToken] so a failure or
+     * success of this switch cannot affect a newer switch's intent.
+     * Without [ownerToken] (default 0) the function samples the pending
+     * intent at entry, which is vulnerable to overlapping switches.
+     */
+    suspend fun switchProfile(
+        name: String,
+        ownerToken: Long = 0L,
+    ): NetworkResult<Unit> {
+        // Use the caller's immutable owner token when provided—
+        // prevents a failure path from clearing a newer switch's
+        // intent, or a success from binding the wrong generation.
+        val token = if (ownerToken > 0L) ownerToken else pendingCanonicalIntent.get()?.generation ?: 0L
+
         val result =
             withContext(ioDispatcher) {
                 safeApiCall { ApiClient.hermesApi.setActiveProfile(SetActiveProfileRequest(name)) }
@@ -154,12 +280,21 @@ object ProfileSwitchCoordinator {
         if (result !is NetworkResult.Success) {
             // Clear pending canonical intent on REST failure so a stale
             // gateway.ready cannot consume a session for the wrong profile.
-            clearCanonicalIntent()
+            // Use [ownerToken] so we only clear the intent owned by this
+            // switch — a newer switch's intent is preserved.
+            clearCanonicalIntent(token)
             return result
         }
 
         AuthManager.setActiveProfileId(name)
-        _switched.emit(name)
+        // Bind the active switch generation to this switch's token BEFORE
+        // the switched event is emitted, so ChatViewModel's collector can
+        // capture it for gateway.ready validation. consumeCanonicalIntent
+        // then validates the pending intent against this generation, which
+        // prevents a late gateway.ready from an older switch from consuming
+        // a newer intent.
+        activeSwitchGeneration = token
+        _switched.emit(SwitchedPayload(profileName = name, ownerToken = token))
         // The ticket mint inside connect() does blocking network I/O — it must
         // run off the main thread or the dial crashes with
         // NetworkOnMainThreadException and falls back to the 1s reconnect

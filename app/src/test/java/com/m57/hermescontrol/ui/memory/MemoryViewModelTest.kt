@@ -7,6 +7,7 @@ import com.m57.hermescontrol.data.model.MemoryResponse
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.remote.HermesApiService
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
+import com.m57.hermescontrol.data.session.SwitchedPayload
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
@@ -38,7 +39,7 @@ import retrofit2.Response
 class MemoryViewModelTest {
     private val testDispatcher = StandardTestDispatcher()
     private lateinit var mockApi: HermesApiService
-    private val mockSwitchFlow = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    private val mockSwitchFlow = MutableSharedFlow<SwitchedPayload>(extraBufferCapacity = 1)
     private val mockConnSwitchFlow = MutableSharedFlow<String>(extraBufferCapacity = 1)
 
     private val memoryResponse =
@@ -92,7 +93,7 @@ class MemoryViewModelTest {
         testDispatcher.scheduler.advanceUntilIdle()
         coVerify(exactly = 0) { mockApi.getMemory() }
 
-        mockSwitchFlow.tryEmit("yasmin")
+        mockSwitchFlow.tryEmit(SwitchedPayload(profileName = "yasmin", ownerToken = 1L))
         testDispatcher.scheduler.advanceUntilIdle()
 
         coVerify(exactly = 1) { mockApi.getMemory() }

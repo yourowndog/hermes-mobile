@@ -28,6 +28,7 @@ import com.m57.hermescontrol.data.remote.GatewayFileClient
 import com.m57.hermescontrol.data.remote.GatewayFileResult
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
+import com.m57.hermescontrol.data.session.SwitchedPayload
 import com.m57.hermescontrol.data.ws.ConnectionOperationParser
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
@@ -86,7 +87,7 @@ class ChatViewModelTest {
     private val testDispatcher = StandardTestDispatcher()
     private val mockEventsFlow = MutableSharedFlow<WsEvent>(extraBufferCapacity = 64)
     private val mockConnectionStatus = MutableStateFlow(ConnectionStatus.DISCONNECTED)
-    private val mockSwitchFlow = MutableSharedFlow<String>(extraBufferCapacity = 8)
+    private val mockSwitchFlow = MutableSharedFlow<SwitchedPayload>(extraBufferCapacity = 8)
     private lateinit var app: Application
     private lateinit var fakeRepo: FakeChatPersistenceRepository
     private lateinit var fakeSlashUsageStore: FakeSlashUsageStore
@@ -703,7 +704,7 @@ class ChatViewModelTest {
             // re-dialed socket's gateway.ready then auto-creates a FRESH
             // session in the new profile (handleGatewayReady, desktop
             // requestFreshSession parity).
-            mockSwitchFlow.emit("meow")
+            mockSwitchFlow.emit(SwitchedPayload(profileName = "meow", ownerToken = 1L))
             advanceUntilIdle()
 
             assertNull(viewModel.uiState.value.currentSessionId)
@@ -717,7 +718,7 @@ class ChatViewModelTest {
             assertEquals(oldSessionId, viewModel.uiState.value.currentSessionId)
 
             // 1. Switch fires → stale conversation wiped.
-            mockSwitchFlow.emit("meow")
+            mockSwitchFlow.emit(SwitchedPayload(profileName = "meow", ownerToken = 1L))
             advanceUntilIdle()
             assertNull(viewModel.uiState.value.currentSessionId)
 
@@ -9502,7 +9503,7 @@ class ChatViewModelTest {
             viewModel.jumpToTimelineEntry(42)
             runCurrent()
             profileFlow.value = "other"
-            mockSwitchFlow.emit("other")
+            mockSwitchFlow.emit(SwitchedPayload(profileName = "other", ownerToken = 1L))
             runCurrent()
             response.complete(
                 retrofit2.Response.success(
