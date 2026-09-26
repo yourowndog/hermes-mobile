@@ -139,6 +139,8 @@ internal fun SettingsAppearancePage(
                 onUseDynamicColorsChange = viewModel::onUseDynamicColorsChange,
                 themePreset = state.themePreset,
                 onThemePresetChange = viewModel::onThemePresetChange,
+                chatFontFamily = state.chatFontFamily,
+                onChatFontFamilyChange = viewModel::onChatFontFamilyChange,
             )
         }
     }
@@ -193,6 +195,8 @@ internal fun SettingsChatPage(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             ChatSection(
+                busySendMode = state.busySendMode,
+                onBusySendModeChange = viewModel::onBusySendModeChange,
                 typingEffectEnabled = state.typingEffectEnabled,
                 onTypingEffectEnabledChange = viewModel::onTypingEffectEnabledChange,
                 typingEffectDelayMs = state.typingEffectDelayMs,
