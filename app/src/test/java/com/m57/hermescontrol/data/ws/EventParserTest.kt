@@ -30,6 +30,25 @@ private fun createJsonRpcResponse(
     )
 
 class EventParserTest {
+    @Test
+    fun notificationShowIsNotAChatReply() {
+        val response =
+            createJsonRpcResponse(
+                jsonrpc = "2.0",
+                id = null,
+                method = "event",
+                params =
+                    mapOf(
+                        "type" to "notification.show",
+                        "payload" to mapOf("text" to "Task completed", "key" to "kanban:watch:t_1:10"),
+                    ),
+            )
+        val event = EventParser.parse(response)
+        assertTrue(event is WsEvent.NotificationShow)
+        assertEquals("Task completed", (event as WsEvent.NotificationShow).text)
+        assertEquals("kanban:watch:t_1:10", event.key)
+    }
+
     @Before
     fun setUp() {
         mockkStatic(android.util.Log::class)

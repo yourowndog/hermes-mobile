@@ -63,6 +63,8 @@ sealed class WsEvent {
         val reasoning: String? = null,
         /** Stored session id captured before background disconnect clears the active mapping. */
         val storedSessionId: String? = null,
+        /** Profile that owns this session (resolved by the client). */
+        val profileName: String? = null,
         /** Full raw payload map (including usage/avg_tps) emitted with message.complete. */
         val rawPayload: Map<String, Any?>? = null,
         /** Stable completion identity for notification and read-tracking correlation. */
@@ -201,6 +203,12 @@ sealed class WsEvent {
     ) : WsEvent()
 
     // ── Status ───────────────────────────────────────────────────────────
+
+    /** Out-of-band notice: never a reply or chat transcript row. */
+    data class NotificationShow(
+        val text: String,
+        val key: String?,
+    ) : WsEvent()
 
     data class StatusUpdate(
         val status: String?,

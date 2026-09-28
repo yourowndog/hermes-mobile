@@ -7,18 +7,48 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
 /**
- * Full Material 3 type hierarchy — every style explicitly tuned so the
- * app stops inheriting Compose defaults.
- *
- * Letter spacing is tighter than M3 defaults (modern look), line heights are
- * comfortable for long-form.
+ * Available font-family options for the app's theme settings.
+ * Each entry maps to a Compose [FontFamily] and a display name
+ * shown in the settings UI. The [key] is the persisted string
+ * value stored in [com.m57.hermescontrol.data.config.ServerStoreState.chatFontFamily].
  */
-val Typography =
+enum class AppFontFamily(
+    val key: String,
+    val displayName: String,
+    val toFontFamily: FontFamily,
+) {
+    SYSTEM("system", "System Default", FontFamily.Default),
+    SANS_SERIF("sans_serif", "Sans Serif", FontFamily.SansSerif),
+    SERIF("serif", "Serif", FontFamily.Serif),
+    MONOSPACE("monospace", "Monospace", FontFamily.Monospace),
+    CURSIVE("cursive", "Cursive", FontFamily.Cursive),
+    ;
+
+    companion object {
+        /** Resolves a persisted [key] to its enum entry, defaulting to [SYSTEM]. */
+        fun fromKey(key: String): AppFontFamily =
+            entries.firstOrNull { it.key == key } ?: SYSTEM
+
+        /** All display names for the settings UI. */
+        val displayNames: Array<String> = entries.map { it.displayName }.toTypedArray()
+
+        /** All keys for serialization. */
+        val keys: Array<String> = entries.map { it.key }.toTypedArray()
+    }
+}
+
+/**
+ * Converts a [FontFamily] parameter into a full Material 3 [Typography]
+ * hierarchy. Each style uses the passed [fontFamily] instead of
+ * [FontFamily.Default], enabling dynamic font-family selection from
+ * [AppFontFamily].
+ */
+fun createTypography(fontFamily: FontFamily): Typography =
     Typography(
         // Display — hero numbers, big stats
         displayLarge =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Bold,
                 fontSize = 44.sp,
                 lineHeight = 52.sp,
@@ -26,7 +56,7 @@ val Typography =
             ),
         displayMedium =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Bold,
                 fontSize = 36.sp,
                 lineHeight = 44.sp,
@@ -34,7 +64,7 @@ val Typography =
             ),
         displaySmall =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 30.sp,
                 lineHeight = 38.sp,
@@ -43,7 +73,7 @@ val Typography =
         // Headline — empty-state titles, screen intros
         headlineLarge =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 28.sp,
                 lineHeight = 34.sp,
@@ -51,7 +81,7 @@ val Typography =
             ),
         headlineMedium =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 24.sp,
                 lineHeight = 30.sp,
@@ -59,7 +89,7 @@ val Typography =
             ),
         headlineSmall =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 20.sp,
                 lineHeight = 26.sp,
@@ -68,7 +98,7 @@ val Typography =
         // Title — TopAppBar, card headings
         titleLarge =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 20.sp,
                 lineHeight = 26.sp,
@@ -76,7 +106,7 @@ val Typography =
             ),
         titleMedium =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Medium,
                 fontSize = 16.sp,
                 lineHeight = 22.sp,
@@ -84,7 +114,7 @@ val Typography =
             ),
         titleSmall =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Medium,
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -93,7 +123,7 @@ val Typography =
         // Body — primary reading
         bodyLarge =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Normal,
                 fontSize = 16.sp,
                 lineHeight = 24.sp,
@@ -101,7 +131,7 @@ val Typography =
             ),
         bodyMedium =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Normal,
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -109,7 +139,7 @@ val Typography =
             ),
         bodySmall =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Normal,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
@@ -118,7 +148,7 @@ val Typography =
         // Label — buttons, chips, captions
         labelLarge =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.SemiBold,
                 fontSize = 14.sp,
                 lineHeight = 20.sp,
@@ -126,7 +156,7 @@ val Typography =
             ),
         labelMedium =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Medium,
                 fontSize = 12.sp,
                 lineHeight = 16.sp,
@@ -134,10 +164,22 @@ val Typography =
             ),
         labelSmall =
             TextStyle(
-                fontFamily = FontFamily.Default,
+                fontFamily = fontFamily,
                 fontWeight = FontWeight.Medium,
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
                 letterSpacing = 0.5.sp,
             ),
     )
+
+/**
+ * Full Material 3 type hierarchy — every style explicitly tuned so the
+ * app stops inheriting Compose defaults.
+ *
+ * Letter spacing is tighter than M3 defaults (modern look), line heights are
+ * comfortable for long-form.
+ *
+ * This [val] is deprecated: use [createTypography] instead to make
+ * font-family dynamic at runtime.
+ */
+val Typography = createTypography(FontFamily.Default)

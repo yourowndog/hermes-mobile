@@ -17,6 +17,7 @@ import com.m57.hermescontrol.data.remote.NetworkMonitor
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.data.ws.WsEvent
+import com.m57.hermescontrol.ui.chat.replyFailureFromPayload
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,6 +27,46 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
+
+internal data class MessageCompleteNotificationPlan(
+    val text: String,
+    val sessionId: String?,
+    val isReplyMessage: Boolean,
+    val completionId: String?,
+    val correlationText: String?,
+    val allowInlineReply: Boolean,
+)
+
+internal fun messageCompleteNotificationPlan(
+    event: WsEvent.MessageComplete,
+    targetSessionId: String?,
+    newMessageText: String,
+    failureText: String,
+): MessageCompleteNotificationPlan {
+    if (replyFailureFromPayload(event.rawPayload, fallback = "") != null) {
+        return MessageCompleteNotificationPlan(
+            text = failureText,
+            sessionId = targetSessionId,
+            isReplyMessage = false,
+            completionId = null,
+            correlationText = null,
+            allowInlineReply = false,
+        )
+    }
+
+    return MessageCompleteNotificationPlan(
+        text =
+            event.text
+                .take(100)
+                .replace("\n", " ")
+                .ifBlank { newMessageText },
+        sessionId = targetSessionId,
+        isReplyMessage = true,
+        completionId = event.completionId,
+        correlationText = event.text,
+        allowInlineReply = true,
+    )
+}
 
 /**
  * Foreground service that keeps the WebSocket connection alive while the app
@@ -111,19 +152,22 @@ class ChatNotificationService : Service() {
                             if (!isAppInForeground.get()) {
                                 when (event) {
                                     is WsEvent.MessageComplete -> {
-                                        val preview =
-                                            event.text
-                                                .take(100)
-                                                .replace("\n", " ")
-                                                .ifBlank { getString(R.string.notif_new_message) }
                                         val targetSessionId =
                                             event.storedSessionId
                                                 ?: ActiveSessionHolder.resolveStoredSessionId(event.sessionId)
+                                        val plan =
+                                            messageCompleteNotificationPlan(
+                                                event = event,
+                                                targetSessionId = targetSessionId,
+                                                newMessageText = getString(R.string.notif_new_message),
+                                                failureText = getString(R.string.chat_reply_failed_title),
+                                            )
                                         showReplyNotification(
-                                            text = preview,
-                                            sessionId = targetSessionId,
-                                            isReplyMessage = true,
-                                            completionId = event.completionId,
+                                            text = plan.text,
+                                            sessionId = plan.sessionId,
+                                            isReplyMessage = plan.isReplyMessage,
+                                            completionId = plan.completionId,
+                                            allowInlineReply = plan.allowInlineReply,
                                             // The durable REST row for this turn, when the
                                             // boundary armed before the prompt was submitted
                                             // still lets us name it unambiguously. Null is a
@@ -133,6 +177,7 @@ class ChatNotificationService : Service() {
                                             // duplicate reply.
                                             serverMessageId =
                                                 coalesceTurnRow(targetSessionId, event.text),
+                                            profileName = event.profileName,
                                         )
                                         // The wait is over — retire the foreground
                                         // service. The reply notification above
@@ -143,6 +188,14 @@ class ChatNotificationService : Service() {
                                         // ON_STOP (issue #794).
                                         // A delayed completion must not retire a newer turn/start.
                                         BackgroundConnectionController.default.onReplyCompleted(generation)
+                                    }
+
+                                    is WsEvent.NotificationShow -> {
+                                        // Operational notices do not complete a pending reply,
+                                        // enter chat history, or offer a misleading reply action.
+                                        if (event.key?.startsWith("kanban:") == true && event.text.isNotBlank()) {
+                                            showOperationalNotification(event.text)
+                                        }
                                     }
 
                                     is WsEvent.ClarifyRequest -> {
@@ -210,12 +263,31 @@ class ChatNotificationService : Service() {
         }
     }
 
+    private fun showOperationalNotification(text: String) {
+        val notification =
+            NotificationCompat
+                .Builder(this, CHAT_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(getString(R.string.notif_title))
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setAutoCancel(true)
+                .setContentIntent(buildContentIntent(null))
+                .build()
+        // Separate identity preserves existing reply notifications and their read tracking.
+        getSystemService(NotificationManager::class.java).notify("kanban", 3, notification)
+    }
+
     private fun showReplyNotification(
         text: String,
         sessionId: String?,
         isReplyMessage: Boolean = false,
         completionId: String? = null,
         serverMessageId: Int? = null,
+        allowInlineReply: Boolean = true,
+        profileName: String? = null,
     ) {
         val builder =
             NotificationCompat
@@ -227,7 +299,7 @@ class ChatNotificationService : Service() {
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setAutoCancel(true)
-                .setContentIntent(buildContentIntent(sessionId))
+                .setContentIntent(buildContentIntent(sessionId, profileName))
 
         var replyGeneration: Long? = null
         if (isReplyMessage && !sessionId.isNullOrBlank() && !completionId.isNullOrBlank()) {
@@ -252,17 +324,23 @@ class ChatNotificationService : Service() {
                     serverMessageId?.let {
                         putInt(ReplyNotificationTracker.EXTRA_SERVER_MESSAGE_ID, it)
                     }
+                    profileName?.let {
+                        putString(NotificationReplyReceiver.EXTRA_PROFILE_NAME, it)
+                    }
                 },
             )
         } else {
             builder.addExtras(
                 android.os.Bundle().apply {
                     putString(ReplyNotificationTracker.EXTRA_NOTIF_KIND, ReplyNotificationTracker.KIND_ACTION)
+                    profileName?.let {
+                        putString(NotificationReplyReceiver.EXTRA_PROFILE_NAME, it)
+                    }
                 },
             )
         }
 
-        if (!sessionId.isNullOrBlank()) {
+        if (allowInlineReply && !sessionId.isNullOrBlank()) {
             val replyLabel = getString(R.string.notif_reply_placeholder)
             val remoteInput =
                 RemoteInput
@@ -280,6 +358,9 @@ class ChatNotificationService : Service() {
                         )
                     setPackage(packageName)
                     putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
+                    profileName?.let {
+                        putExtra(NotificationReplyReceiver.EXTRA_PROFILE_NAME, it)
+                    }
                 }
 
             val replyPendingIntent =
@@ -317,7 +398,10 @@ class ChatNotificationService : Service() {
         }
     }
 
-    private fun buildContentIntent(sessionId: String?): PendingIntent {
+    private fun buildContentIntent(
+        sessionId: String?,
+        profileName: String? = null,
+    ): PendingIntent {
         val intent =
             Intent(this, MainActivity::class.java).apply {
                 action = MainActivity.ACTION_OPEN_CHAT_FROM_NOTIFICATION
@@ -326,6 +410,9 @@ class ChatNotificationService : Service() {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 if (!sessionId.isNullOrBlank()) {
                     putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
+                }
+                if (!profileName.isNullOrBlank()) {
+                    putExtra(NotificationReplyReceiver.EXTRA_PROFILE_NAME, profileName)
                 }
             }
         return PendingIntent.getActivity(
