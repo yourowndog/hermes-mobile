@@ -255,6 +255,9 @@ object ChatWsEventReducer {
             // Change events (issue #784) are consumed by their screens' ViewModels
             is WsEvent.ChangeEvent -> ReducerResult(state = state, streamingState = streamingState)
 
+            // Operational notices never mutate messages or pending reply state.
+            is WsEvent.NotificationShow -> ReducerResult(state = state, streamingState = streamingState)
+
             // TranscriptResyncRequired is handled by ChatViewModel directly (refetch history on replay gap)
             is WsEvent.TranscriptResyncRequired -> ReducerResult(state = state, streamingState = streamingState)
         }

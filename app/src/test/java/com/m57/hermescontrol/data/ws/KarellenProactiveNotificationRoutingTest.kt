@@ -99,7 +99,7 @@ class KarellenProactiveNotificationRoutingTest {
         val enrichedEvent =
             rawEvent.copy(
                 storedSessionId = ActiveSessionHolder.resolveStoredSessionId(rawEvent.sessionId),
-                profileName = SessionProfileTracker.resolveProfile(rawEvent.sessionId),
+                profileName = SessionProfileTracker.resolveProfile(requireNotNull(rawEvent.sessionId)),
             )
 
         // Then: profileName is resolved

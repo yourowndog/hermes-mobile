@@ -204,6 +204,12 @@ sealed class WsEvent {
 
     // ── Status ───────────────────────────────────────────────────────────
 
+    /** Out-of-band notice: never a reply or chat transcript row. */
+    data class NotificationShow(
+        val text: String,
+        val key: String?,
+    ) : WsEvent()
+
     data class StatusUpdate(
         val status: String?,
         val data: Map<String, Any?>?,

@@ -190,6 +190,14 @@ class ChatNotificationService : Service() {
                                         BackgroundConnectionController.default.onReplyCompleted(generation)
                                     }
 
+                                    is WsEvent.NotificationShow -> {
+                                        // Operational notices do not complete a pending reply,
+                                        // enter chat history, or offer a misleading reply action.
+                                        if (event.key?.startsWith("kanban:") == true && event.text.isNotBlank()) {
+                                            showOperationalNotification(event.text)
+                                        }
+                                    }
+
                                     is WsEvent.ClarifyRequest -> {
                                         showReplyNotification(getString(R.string.notif_clarification_needed), null)
                                     }
@@ -253,6 +261,23 @@ class ChatNotificationService : Service() {
         } catch (e: Exception) {
             null
         }
+    }
+
+    private fun showOperationalNotification(text: String) {
+        val notification =
+            NotificationCompat
+                .Builder(this, CHAT_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(getString(R.string.notif_title))
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setAutoCancel(true)
+                .setContentIntent(buildContentIntent(null))
+                .build()
+        // Separate identity preserves existing reply notifications and their read tracking.
+        getSystemService(NotificationManager::class.java).notify("kanban", 3, notification)
     }
 
     private fun showReplyNotification(

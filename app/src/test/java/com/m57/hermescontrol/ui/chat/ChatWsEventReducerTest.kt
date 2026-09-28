@@ -10,6 +10,22 @@ import org.junit.Test
 
 class ChatWsEventReducerTest {
     @Test
+    fun operationalNoticeDoesNotChangeTranscriptOrStreamingState() {
+        val state = ChatUiState(currentSessionId = "session-1")
+        val streaming = StreamingState()
+        val result =
+            ChatWsEventReducer.reduce(
+                state = state,
+                streamingState = streaming,
+                event = WsEvent.NotificationShow("Task completed", "kanban:watch:t1:1"),
+                currentSessionId = "session-1",
+            )
+        assertEquals(state, result.state)
+        assertEquals(streaming, result.streamingState)
+        assertTrue(result.effects.isEmpty())
+    }
+
+    @Test
     fun testMessageComplete_clearsResolvedClarifyRequest() {
         val state =
             ChatUiState(
