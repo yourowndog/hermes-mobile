@@ -30,6 +30,12 @@ data class ThemeMarketplaceUiState(
     val applyingExtensionId: String? = null,
     /** Last apply failure, shown on the card being applied. */
     val applyError: String? = null,
+    /** Row the last [applyError] belongs to, so the failure stays visible after the apply stops. */
+    val applyErrorExtensionId: String? = null,
+    /** Currently selected entry for detail preview; null when no detail is open. */
+    val selectedEntry: String? = null,
+    /** Cached resolved assets per extensionId, keyed by extension ID. */
+    val resolvedAssets: Map<String, ThemeAssets> = emptyMap(),
 )
 
 /**
@@ -57,8 +63,12 @@ class ThemeMarketplaceViewModel(
     /** Applied marketplace theme id; drives the active badge. */
     val activeCustomThemeId: StateFlow<String?> = applier.activeCustomThemeId
 
+    /** Applied marketplace theme display name (spec M5: name + source id). */
+    val activeCustomThemeName: StateFlow<String?> = applier.activeCustomThemeName
+
     private var debounceJob: Job? = null
     private var applyJob: Job? = null
+    private var assetsJob: Job? = null
     private var loadedPage = 0
 
     init {
@@ -66,7 +76,7 @@ class ThemeMarketplaceViewModel(
     }
 
     override fun clearToast() {
-        _uiState.update { it.copy(errorMessage = null, applyError = null) }
+        _uiState.update { it.copy(errorMessage = null, applyError = null, applyErrorExtensionId = null) }
     }
 
     /** Debounced search-as-you-type. */
@@ -92,9 +102,25 @@ class ThemeMarketplaceViewModel(
         runSearch(query = state.query, page = loadedPage + 1)
     }
 
-    /** Resolve preview/download metadata for a row on demand (cached). */
-    suspend fun resolveAssets(extensionId: String): ThemeAssets? =
-        (repository.resolveAssets(extensionId) as? NetworkResult.Success)?.data
+    /**
+     * Select an entry for the detail dialog. This never touches the applied
+     * theme — only [applyTheme] does (spec M4). Preview/download metadata is
+     * resolved once per entry and kept in [ThemeMarketplaceUiState.resolvedAssets].
+     */
+    fun selectEntry(entry: MarketplaceThemeEntry?) {
+        val extensionId = entry?.extensionId
+        _uiState.update { it.copy(selectedEntry = extensionId) }
+        if (extensionId == null) return
+        if (_uiState.value.resolvedAssets.containsKey(extensionId)) return
+        assetsJob?.cancel()
+        assetsJob =
+            viewModelScope.launch {
+                val assets =
+                    (repository.resolveAssets(extensionId) as? NetworkResult.Success)?.data
+                        ?: return@launch
+                _uiState.update { it.copy(resolvedAssets = it.resolvedAssets + (extensionId to assets)) }
+            }
+    }
 
     /**
      * Apply a marketplace theme: resolve the `.vsix` URL, download, parse
@@ -107,9 +133,21 @@ class ThemeMarketplaceViewModel(
         applyJob?.cancel()
         applyJob =
             viewModelScope.launch {
-                _uiState.update { it.copy(applyingExtensionId = entry.extensionId, applyError = null) }
+                _uiState.update {
+                    it.copy(
+                        applyingExtensionId = entry.extensionId,
+                        applyError = null,
+                        applyErrorExtensionId = null,
+                    )
+                }
                 val failure = applyNow(entry)
-                _uiState.update { it.copy(applyingExtensionId = null, applyError = failure) }
+                _uiState.update {
+                    it.copy(
+                        applyingExtensionId = null,
+                        applyError = failure,
+                        applyErrorExtensionId = failure?.let { _ -> entry.extensionId },
+                    )
+                }
             }
     }
 
@@ -175,8 +213,9 @@ class ThemeMarketplaceViewModel(
         }
     }
 
-    private companion object {
-        const val SEARCH_DEBOUNCE_MS = 300L
-        const val PAGE_SIZE = 20
+    /** `internal` so the offline unit tests can assert the real debounce/page sizes. */
+    companion object {
+        internal const val SEARCH_DEBOUNCE_MS = 300L
+        internal const val PAGE_SIZE = 20
     }
 }

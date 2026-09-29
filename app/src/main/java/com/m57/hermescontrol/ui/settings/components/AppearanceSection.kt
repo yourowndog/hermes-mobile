@@ -44,6 +44,7 @@ import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
 import com.m57.hermescontrol.ui.chat.label
 import com.m57.hermescontrol.ui.settings.SectionCard
+import com.m57.hermescontrol.ui.thememarketplace.ThemeMarketplaceRecoveryBanner
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -57,8 +58,21 @@ internal fun AppearanceSection(
     onThemePresetChange: (ThemePreset) -> Unit,
     chatFontFamily: String,
     onChatFontFamilyChange: (String) -> Unit,
+    customThemeUnavailable: Boolean = false,
+    unavailableThemeName: String? = null,
+    onReapplyCustomTheme: () -> Unit = {},
+    onClearCustomTheme: () -> Unit = {},
 ) {
     SectionCard {
+        if (customThemeUnavailable) {
+            ThemeMarketplaceRecoveryBanner(
+                themeName = unavailableThemeName,
+                onReapply = onReapplyCustomTheme,
+                onClear = onClearCustomTheme,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         Text(
             text = stringResource(R.string.settings_item_theme),
             style = MaterialTheme.typography.bodyLarge,
