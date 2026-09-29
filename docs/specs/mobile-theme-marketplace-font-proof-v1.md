@@ -314,3 +314,46 @@ No implementation in this stage; this document is the gate for it.
   CI emulator (`.github/workflows/android.yml:317-326`, api 34 `aosp_atd`).
 - Stale preset-count follow-ups (separate cards, not this spec): `ThemePreset` has seven built-ins plus
   `CUSTOM` (`app/src/main/java/com/m57/hermescontrol/theme/Theme.kt:32`); prose still saying "six" (e.g. `AGENTS.md` theme section) is stale.
+
+## 8. Implementation notes
+
+Recorded by the implementer. These are decisions taken while building against
+this spec, not spec changes; nothing here flips the approval status in the
+header, and any item that *contradicts* a requirement above would need the
+human to rule on it.
+
+- **D1 — Detail is a dialog, not a separate screen (M4).** `DetailDialog` /
+  `DetailRow` from `ui/common` are reused instead of adding a
+  `ThemeMarketplaceDetailScreen` + dedicated ViewModel + `NavKey`. Spec §6
+  offered either, and the project's own convention ("extend rather than
+  duplicate", 28+ screens exist) points at reuse. Select-then-apply is
+  unchanged: a row tap only calls `viewModel.selectEntry(entry)`, and Apply
+  lives solely in the dialog's action slot.
+- **D2 — M6 trigger is the applier's own signal, not a UI-side derivation.** The
+  banner shows when `themePreset == ThemePreset.CUSTOM && ThemeApplier.restoreFailed`.
+  `restorePersisted` is called unconditionally from `AuthManager.init:244`, so
+  the preset check is load-bearing: a blank payload for a built-in preset must
+  not raise a recovery banner. An earlier draft derived the state from
+  `activeCustomThemeId == null`; that is indistinguishable from "never applied",
+  so it could not tell a failed restore from a fresh install.
+- **D3 — Recovery banner is one shared composable.**
+  `ThemeMarketplaceRecoveryBanner` is used by both the marketplace screen and
+  appearance settings, with the same name, message, Re-apply and Clear actions,
+  so the two surfaces cannot drift. Re-apply is surface-specific by necessity:
+  on the marketplace screen it seeds the search box with the failed gallery id;
+  in settings it navigates to the marketplace screen.
+- **D4 — Font proof is instrumented, not JVM.** `android.graphics.Paint`
+  measurement is meaningless off-device and this module has no Robolectric
+  dependency, so the glyph-width proof is an `androidTest`. The test emits the
+  CSV the spec's F2 evidence table requires via `Log` (CI job output); the
+  `cacheDir` write is best-effort only. Collision handling is asymmetric on
+  purpose: Sans Serif / Serif / Monospace are separate real faces in every AOSP
+  image, so a collision there fails the build, while SYSTEM-vs-Sans-Serif
+  (expected — Compose resolves `FontFamily.Default` to the platform sans-serif)
+  and Cursive (image-dependent) are reported with their measured numbers for the
+  merge-or-label decision F2 asks for, rather than being assumed either way.
+  **No measurement has been taken yet**, so no distinctness claim is made and no
+  option has been merged or relabelled.
+- **D5 — ViewModel constants are `internal`.** `SEARCH_DEBOUNCE_MS` and
+  `PAGE_SIZE` were private so tests could only assert hard-coded literals,
+  which proves nothing. They are now asserted directly.
