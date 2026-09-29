@@ -38,9 +38,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
+import com.m57.hermescontrol.data.model.BusySendMode
+import com.m57.hermescontrol.theme.AppFontFamily
 import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
+import com.m57.hermescontrol.ui.chat.label
 import com.m57.hermescontrol.ui.settings.SectionCard
+import com.m57.hermescontrol.ui.thememarketplace.ThemeMarketplaceRecoveryBanner
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -52,8 +56,23 @@ internal fun AppearanceSection(
     onUseDynamicColorsChange: (Boolean) -> Unit,
     themePreset: ThemePreset,
     onThemePresetChange: (ThemePreset) -> Unit,
+    chatFontFamily: String,
+    onChatFontFamilyChange: (String) -> Unit,
+    customThemeUnavailable: Boolean = false,
+    unavailableThemeName: String? = null,
+    onReapplyCustomTheme: () -> Unit = {},
+    onClearCustomTheme: () -> Unit = {},
 ) {
     SectionCard {
+        if (customThemeUnavailable) {
+            ThemeMarketplaceRecoveryBanner(
+                themeName = unavailableThemeName,
+                onReapply = onReapplyCustomTheme,
+                onClear = onClearCustomTheme,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         Text(
             text = stringResource(R.string.settings_item_theme),
             style = MaterialTheme.typography.bodyLarge,
@@ -136,6 +155,7 @@ internal fun AppearanceSection(
                         ThemePreset.AMOLED -> stringResource(R.string.theme_preset_amoled)
                         ThemePreset.NORD -> stringResource(R.string.theme_preset_nord)
                         ThemePreset.CYBERPUNK -> stringResource(R.string.theme_preset_cyberpunk)
+                        ThemePreset.CUSTOM -> stringResource(R.string.theme_preset_custom)
                     },
                 )
             }
@@ -190,6 +210,12 @@ internal fun AppearanceSection(
                                             R.string.theme_preset_cyberpunk,
                                         )
                                     }
+
+                                    ThemePreset.CUSTOM -> {
+                                        stringResource(
+                                            R.string.theme_preset_custom,
+                                        )
+                                    }
                                 },
                             )
                         },
@@ -199,6 +225,50 @@ internal fun AppearanceSection(
                         },
                     )
                 }
+            }
+        }
+    }
+
+    Spacer(modifier = Modifier.height(16.dp))
+
+    Text(
+        text = stringResource(R.string.settings_item_chat_font_family),
+        style = MaterialTheme.typography.bodyLarge,
+    )
+    Text(
+        text = stringResource(R.string.settings_desc_chat_font_family),
+        style =
+            MaterialTheme.typography.bodySmall.copy(
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+
+    var fontFamilyExpanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { fontFamilyExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                AppFontFamily.entries.first { it.key == chatFontFamily }.displayName,
+            )
+        }
+        DropdownMenu(
+            expanded = fontFamilyExpanded,
+            onDismissRequest = { fontFamilyExpanded = false },
+            modifier = Modifier.fillMaxWidth(0.85f),
+        ) {
+            AppFontFamily.entries.forEach { font ->
+                DropdownMenuItem(
+                    text = {
+                        Text(font.displayName)
+                    },
+                    onClick = {
+                        onChatFontFamilyChange(font.key)
+                        fontFamilyExpanded = false
+                    },
+                )
             }
         }
     }
@@ -222,6 +292,8 @@ internal fun ChatSection(
     onTokensPerSecondChange: (Boolean) -> Unit = {},
     showModelProvider: Boolean = false,
     onShowModelProviderChange: (Boolean) -> Unit = {},
+    busySendMode: BusySendMode = BusySendMode.CORRECT,
+    onBusySendModeChange: (BusySendMode) -> Unit = {},
 ) {
     val fontScaleOptions = listOf(0.85f, 1.0f, 1.15f, 1.30f, 1.50f)
     val currentIndex =
@@ -230,6 +302,38 @@ internal fun ChatSection(
             .takeIf { it >= 0 } ?: 1
 
     SectionCard {
+        var busyModeExpanded by remember { mutableStateOf(false) }
+        Text(
+            text = stringResource(R.string.chat_busy_mode_title),
+            style = MaterialTheme.typography.bodyLarge,
+        )
+        Text(
+            text = stringResource(R.string.chat_busy_mode_desc),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Box {
+            OutlinedButton(onClick = { busyModeExpanded = true }, modifier = Modifier.testTag("busy_send_default")) {
+                Text(busySendMode.label())
+            }
+            DropdownMenu(expanded = busyModeExpanded, onDismissRequest = { busyModeExpanded = false }) {
+                BusySendMode.entries.forEach { mode ->
+                    DropdownMenuItem(
+                        text = { Text(mode.label()) },
+                        onClick = {
+                            onBusySendModeChange(mode)
+                            busyModeExpanded = false
+                        },
+                    )
+                }
+            }
+        }
+        Text(
+            text = stringResource(R.string.chat_busy_interrupt_warning),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(16.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,

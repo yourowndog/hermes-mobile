@@ -31,6 +31,12 @@ import kotlinx.coroutines.withContext
  *     auto-creates a FRESH session in the new profile (desktop parity).
  *  4. Re-dial the WebSocket so the gateway re-homes chat to the new profile.
  */
+data class CanonicalSessionIntent(
+    val sessionId: String,
+    val profileName: String,
+    val generation: Long,
+)
+
 object ProfileSwitchCoordinator {
     /**
      * Dispatcher for the blocking network hops below.
@@ -50,6 +56,61 @@ object ProfileSwitchCoordinator {
     private val _connectionSwitched = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val connectionSwitched: SharedFlow<String> = _connectionSwitched.asSharedFlow()
 
+    // ── Canonical-session intent (profile- and generation-scoped) ─────
+
+    @Volatile
+    private var pendingCanonicalIntent: CanonicalSessionIntent? = null
+    private var nextSwitchGeneration = 0L
+
+    /**
+     * Set a canonical-session intent scoped to [profileName]. Returns the
+     * generation token that must match on consumption — older intents are
+     * stale and ignored.
+     *
+     * Call BEFORE [switchProfile] so the intent is armed in time for a fast
+     * gateway.ready. Clear the intent with [clearCanonicalIntent] if the
+     * switch fails or is cancelled.
+     */
+    fun setCanonicalIntent(
+        sessionId: String,
+        profileName: String,
+    ): Long {
+        val generation = ++nextSwitchGeneration
+        pendingCanonicalIntent = CanonicalSessionIntent(sessionId, profileName, generation)
+        return generation
+    }
+
+    /**
+     * Consume and return the intent's sessionId only when [profileName] and
+     * [generation] match the pending intent. Returns null on mismatch or when
+     * no intent is set.
+     */
+    fun consumeCanonicalIntent(
+        profileName: String,
+        generation: Long,
+    ): String? {
+        val intent = pendingCanonicalIntent
+        if (intent != null && intent.profileName == profileName && intent.generation == generation) {
+            pendingCanonicalIntent = null
+            return intent.sessionId
+        }
+        return null
+    }
+
+    /** Atomically clear any pending canonical intent. */
+    fun clearCanonicalIntent() {
+        pendingCanonicalIntent = null
+    }
+
+    /**
+     * The generation of the most recent [setCanonicalIntent] call. Zero when
+     * no intent has ever been set. Consumers pass this to [consumeCanonicalIntent]
+     * so that only the latest intent can be consumed.
+     */
+    val canonicalIntentGeneration: Long get() = nextSwitchGeneration
+
+    // ── Profile switch operations ────────────────────────────────────
+
     /**
      * Restore the server-side Hermes profile scope on a cold/fresh app start.
      *
@@ -64,7 +125,9 @@ object ProfileSwitchCoordinator {
      * state before writing so startup never clobbers an explicit user switch.
      */
     suspend fun restoreActiveProfileScopeIfMissing(): String? {
-        AuthManager.activeProfileId.value?.takeIf { it.isNotBlank() }?.let { return it }
+        AuthManager.activeProfileId.value
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
 
         val result =
             withContext(ioDispatcher) {
@@ -87,7 +150,12 @@ object ProfileSwitchCoordinator {
             withContext(ioDispatcher) {
                 safeApiCall { ApiClient.hermesApi.setActiveProfile(SetActiveProfileRequest(name)) }
             }
-        if (result !is NetworkResult.Success) return result
+        if (result !is NetworkResult.Success) {
+            // Clear pending canonical intent on REST failure so a stale
+            // gateway.ready cannot consume a session for the wrong profile.
+            clearCanonicalIntent()
+            return result
+        }
 
         AuthManager.setActiveProfileId(name)
         _switched.emit(name)
@@ -103,13 +171,13 @@ object ProfileSwitchCoordinator {
     }
 
     /**
-     * Switches the CONNECTION profile — which server the app talks to (e.g.
-     * LAN "default" vs a Tailscale host). Unlike [switchProfile] (which only
-     * re-scopes the SERVER-side Hermes profile over the same socket), this
-     * re-points Retrofit AND re-dials the WebSocket, because the socket stays
-     * glued to the old server otherwise: after a switch every REST tab talks
-     * to the new server while chat keeps streaming from the old gateway
-     * (split-brain reproduced live 2026-08-12 on the hyari emulator).
+     * Switch the active server connection profile (not just the bot profile).
+     *
+     * The server connection profile determines which Hermes server the mobile
+     * app talks to (e.g. a Tailscale endpoint vs the default LAN address).
+     * Unlike [switchProfile] (which changes the active bot/hermes profile on
+     * the same server), this repoints both Retrofit and the WebSocket to a
+     * different server.
      *
      * Order matters:
      *  1. Persist the LOCAL selection — the token cache, cookie scope and

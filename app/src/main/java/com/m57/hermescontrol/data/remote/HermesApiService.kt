@@ -7,6 +7,8 @@ import com.m57.hermescontrol.data.model.ActiveProfileResponse
 import com.m57.hermescontrol.data.model.AddMcpServerRequest
 import com.m57.hermescontrol.data.model.AgentPluginInstallBody
 import com.m57.hermescontrol.data.model.AnalyticsResponse
+import com.m57.hermescontrol.data.model.AudioTranscriptionRequest
+import com.m57.hermescontrol.data.model.AudioTranscriptionResponse
 import com.m57.hermescontrol.data.model.AuxiliaryModelsResponse
 import com.m57.hermescontrol.data.model.BackupTriggerRequest
 import com.m57.hermescontrol.data.model.BulkDeleteRequest
@@ -132,6 +134,8 @@ import com.m57.hermescontrol.data.model.ToolsetPostSetupResponse
 import com.m57.hermescontrol.data.model.ToolsetProviderSelectRequest
 import com.m57.hermescontrol.data.model.ToolsetProviderSelectResponse
 import com.m57.hermescontrol.data.model.ToolsetToggleRequest
+import com.m57.hermescontrol.data.model.TtsSpeakRequest
+import com.m57.hermescontrol.data.model.TtsSpeakResponse
 import com.m57.hermescontrol.data.model.UpdateCheckResponse
 import com.m57.hermescontrol.data.model.UpdateCronJobRequest
 import com.m57.hermescontrol.data.model.UpdateProfileDescriptionRequest
@@ -860,6 +864,11 @@ interface HermesApiService : KanbanApiService {
     @GET("api/hermes/update/receipt")
     suspend fun getUpdateReceipt(): Response<UpdateReceiptResponse>
 
+    @POST("api/audio/speak")
+    suspend fun speakText(
+        @Body request: TtsSpeakRequest,
+    ): Response<TtsSpeakResponse>
+
     // ── Admin: Portal ─────────────────────────────────────────────────
     @GET("api/portal")
     suspend fun getPortal(): Response<PortalResponse>
@@ -1030,4 +1039,14 @@ interface HermesApiService : KanbanApiService {
     suspend fun deleteManagedFile(
         @Body body: ManagedFileDelete,
     ): Response<ManagedFileActionResponse>
+
+    // ── Audio: server-side transcription ────────────────────────────────
+    // The dashboard's voice relay (hermes_cli/web_routers/audio.py) — the
+    // same endpoint the desktop client's voice notes use. The clip rides
+    // inline as a base64 data URL; the server resolves STT through the
+    // active profile's configured provider.
+    @POST("api/audio/transcribe")
+    suspend fun transcribeAudio(
+        @Body body: AudioTranscriptionRequest,
+    ): Response<AudioTranscriptionResponse>
 }
