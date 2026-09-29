@@ -1,5 +1,8 @@
 package com.m57.hermescontrol.theme
 
+import com.m57.hermescontrol.data.config.ServerStoreState
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Test
@@ -86,5 +89,34 @@ class AppFontFamilyTest {
         assertEquals("serif", keys[2])
         assertEquals("monospace", keys[3])
         assertEquals("cursive", keys[4])
+    }
+
+    /**
+     * Spec F3, persistence half: every option's key must survive a real
+     * persist/restore round-trip. The existing `ServerStoreTest` only exercises
+     * the `system` default, so a non-default selection surviving a restart was
+     * previously unproven.
+     */
+    @Test
+    fun testEveryKeySurvivesPersistRestoreRoundTrip() {
+        val json = Json { ignoreUnknownKeys = true }
+        AppFontFamily.entries.forEach { family ->
+            val persisted = json.encodeToString(ServerStoreState().copy(chatFontFamily = family.key))
+            val restored = json.decodeFromString<ServerStoreState>(persisted)
+
+            assertEquals(family.key, restored.chatFontFamily)
+            assertEquals(family, AppFontFamily.fromKey(restored.chatFontFamily))
+        }
+    }
+
+    /** A key removed from [AppFontFamily] must not break restore; it falls back. */
+    @Test
+    fun testRemovedKeyFallsBackToSystemOnRestore() {
+        val json = Json { ignoreUnknownKeys = true }
+        val persisted = json.encodeToString(ServerStoreState().copy(chatFontFamily = "comic_sans"))
+        val restored = json.decodeFromString<ServerStoreState>(persisted)
+
+        assertEquals("comic_sans", restored.chatFontFamily)
+        assertEquals(AppFontFamily.SYSTEM, AppFontFamily.fromKey(restored.chatFontFamily))
     }
 }
