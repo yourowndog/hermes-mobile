@@ -39,9 +39,10 @@ class MarketplaceLiveApplyTest {
             // 1. Search the live catalog, pick the first non-icon theme.
             val searchResult = repo.search(query = "color theme", limit = 20)
             assertTrue("live search should succeed", searchResult is NetworkResult.Success)
-            val hit = requireNotNull((searchResult as NetworkResult.Success).data.firstOrNull()) {
-                "live gallery returned no usable theme"
-            }
+            val hit =
+                requireNotNull((searchResult as NetworkResult.Success).data.firstOrNull()) {
+                    "live gallery returned no usable theme"
+                }
 
             // 2. Resolve a downloadable package.
             val assets = repo.resolveAssets(hit.extensionId)
