@@ -85,6 +85,9 @@ android {
 
     buildTypes {
         debug {
+            // Isolate the development app from production (DEVICE_SAFETY): the
+            // .dev applicationId never overwrites com.m57.hermescontrol.
+            applicationIdSuffix = ".dev"
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }

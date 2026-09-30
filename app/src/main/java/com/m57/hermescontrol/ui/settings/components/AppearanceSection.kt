@@ -39,10 +39,12 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.model.BusySendMode
+import com.m57.hermescontrol.theme.AppFontFamily
 import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
 import com.m57.hermescontrol.ui.chat.label
 import com.m57.hermescontrol.ui.settings.SectionCard
+import com.m57.hermescontrol.ui.thememarketplace.ThemeMarketplaceRecoveryBanner
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -54,8 +56,23 @@ internal fun AppearanceSection(
     onUseDynamicColorsChange: (Boolean) -> Unit,
     themePreset: ThemePreset,
     onThemePresetChange: (ThemePreset) -> Unit,
+    chatFontFamily: String,
+    onChatFontFamilyChange: (String) -> Unit,
+    customThemeUnavailable: Boolean = false,
+    unavailableThemeName: String? = null,
+    onReapplyCustomTheme: () -> Unit = {},
+    onClearCustomTheme: () -> Unit = {},
 ) {
     SectionCard {
+        if (customThemeUnavailable) {
+            ThemeMarketplaceRecoveryBanner(
+                themeName = unavailableThemeName,
+                onReapply = onReapplyCustomTheme,
+                onClear = onClearCustomTheme,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         Text(
             text = stringResource(R.string.settings_item_theme),
             style = MaterialTheme.typography.bodyLarge,
@@ -137,6 +154,7 @@ internal fun AppearanceSection(
                         ThemePreset.CATPPUCCIN -> stringResource(R.string.theme_preset_catppuccin)
                         ThemePreset.AMOLED -> stringResource(R.string.theme_preset_amoled)
                         ThemePreset.NORD -> stringResource(R.string.theme_preset_nord)
+                        ThemePreset.CUSTOM -> stringResource(R.string.theme_preset_custom)
                     },
                 )
             }
@@ -185,6 +203,12 @@ internal fun AppearanceSection(
                                             R.string.theme_preset_nord,
                                         )
                                     }
+
+                                    ThemePreset.CUSTOM -> {
+                                        stringResource(
+                                            R.string.theme_preset_custom,
+                                        )
+                                    }
                                 },
                             )
                         },
@@ -194,6 +218,50 @@ internal fun AppearanceSection(
                         },
                     )
                 }
+            }
+        }
+    }
+
+    Spacer(modifier = Modifier.height(16.dp))
+
+    Text(
+        text = stringResource(R.string.settings_item_chat_font_family),
+        style = MaterialTheme.typography.bodyLarge,
+    )
+    Text(
+        text = stringResource(R.string.settings_desc_chat_font_family),
+        style =
+            MaterialTheme.typography.bodySmall.copy(
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+
+    var fontFamilyExpanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { fontFamilyExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                AppFontFamily.entries.first { it.key == chatFontFamily }.displayName,
+            )
+        }
+        DropdownMenu(
+            expanded = fontFamilyExpanded,
+            onDismissRequest = { fontFamilyExpanded = false },
+            modifier = Modifier.fillMaxWidth(0.85f),
+        ) {
+            AppFontFamily.entries.forEach { font ->
+                DropdownMenuItem(
+                    text = {
+                        Text(font.displayName)
+                    },
+                    onClick = {
+                        onChatFontFamilyChange(font.key)
+                        fontFamilyExpanded = false
+                    },
+                )
             }
         }
     }
