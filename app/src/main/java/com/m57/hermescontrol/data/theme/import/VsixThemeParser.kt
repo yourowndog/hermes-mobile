@@ -145,7 +145,8 @@ class VsixThemeParser(
                 "extension/${ref.path}",
             ).distinct()
         for (candidate in candidates) {
-            val match = entries.entries.firstOrNull { (name, _) -> name.equals(candidate, ignoreCase = true) } ?: continue
+            val match =
+                entries.entries.firstOrNull { (name, _) -> name.equals(candidate, ignoreCase = true) } ?: continue
             return readCapped(match.value)
         }
         return null
