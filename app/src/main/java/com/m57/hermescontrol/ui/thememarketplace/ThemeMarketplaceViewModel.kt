@@ -9,6 +9,7 @@ import com.m57.hermescontrol.data.theme.marketplace.MarketplaceThemeEntry
 import com.m57.hermescontrol.data.theme.marketplace.ThemeAssets
 import com.m57.hermescontrol.data.theme.marketplace.ThemeMarketplaceRepository
 import com.m57.hermescontrol.ui.common.ToastHost
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +17,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class ThemeMarketplaceUiState(
     /** Catalog rows for the current query, in gallery sort order. */
@@ -141,7 +143,7 @@ class ThemeMarketplaceViewModel(
                         applyErrorExtensionId = null,
                     )
                 }
-                val failure = applyNow(entry)
+                val failure = withContext(Dispatchers.IO) { applyNow(entry) }
                 _uiState.update {
                     it.copy(
                         applyingExtensionId = null,
@@ -160,7 +162,8 @@ class ThemeMarketplaceViewModel(
             }
         val variants =
             vsixParser.parseVsix(downloadUrl).getOrElse { e ->
-                return "Could not read theme package: ${e.message}"
+                val detail = e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
+                return "Could not read theme package: $detail"
             }
         if (variants.isEmpty() || variants.all { it.colors.isEmpty() }) {
             return "Theme package has no colors to import"

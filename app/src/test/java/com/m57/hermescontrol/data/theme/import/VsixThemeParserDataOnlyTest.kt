@@ -149,6 +149,45 @@ class VsixThemeParserDataOnlyTest {
             assertFalse(variants.any { it.colors.keys.any { key -> key.endsWith(".js") } })
         }
 
+    @Test
+    fun `package with nested theme path like dot-slash theme is extracted correctly`() =
+        runTest {
+            val nestedPackage =
+                """
+                {
+                  "name": "dracula-like",
+                  "contributes": {
+                    "themes": [
+                      { "label": "Dracula", "uiTheme": "vs-dark", "path": "./theme/dracula.json" }
+                    ]
+                  }
+                }
+                """.trimIndent()
+            val themeJson =
+                """
+                {
+                  "name": "Dracula",
+                  "type": "dark",
+                  "colors": {
+                    "editor.background": "#282A36",
+                    "editor.foreground": "#F8F8F2"
+                  }
+                }
+                """.trimIndent()
+            val out = ByteArrayOutputStream()
+            ZipOutputStream(out).use { zip ->
+                zip.write("extension/package.json", nestedPackage)
+                zip.write("extension/theme/dracula.json", themeJson)
+            }
+            server.enqueue(MockResponse().setBody(Buffer().write(out.toByteArray())))
+            val url = server.url("/dracula.vsix").toString()
+
+            val variants = VsixThemeParser(client = OkHttpClient()).parseVsix(url).getOrThrow()
+            assertEquals(1, variants.size)
+            assertEquals("Dracula", variants.first().label)
+            assertEquals("#282A36", variants.first().colors["editor.background"])
+        }
+
     private fun vsixFixture(
         packageJson: String = this.packageJson,
         themeJson: String = this.themeJson,
