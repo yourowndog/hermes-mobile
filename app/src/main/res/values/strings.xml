@@ -371,6 +371,7 @@
     <string name="theme_preset_amoled">AMOLED Black (Dark only)</string>
     <string name="theme_preset_nord">Nord</string>
     <string name="theme_preset_garnet">Garnet</string>
+    <string name="theme_preset_cyberpunk">Cyberpunk (Dark only)</string>
     <string name="theme_preset_custom">Custom (marketplace)</string>
 
     <!-- Theme Marketplace -->

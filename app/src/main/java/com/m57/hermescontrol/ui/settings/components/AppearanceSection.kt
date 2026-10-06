@@ -155,6 +155,7 @@ internal fun AppearanceSection(
                         ThemePreset.AMOLED -> stringResource(R.string.theme_preset_amoled)
                         ThemePreset.NORD -> stringResource(R.string.theme_preset_nord)
                         ThemePreset.GARNET -> stringResource(R.string.theme_preset_garnet)
+                        ThemePreset.CYBERPUNK -> stringResource(R.string.theme_preset_cyberpunk)
                         ThemePreset.CUSTOM -> stringResource(R.string.theme_preset_custom)
                     },
                 )
@@ -209,6 +210,10 @@ internal fun AppearanceSection(
                                         stringResource(
                                             R.string.theme_preset_garnet,
                                         )
+                                    }
+
+                                    ThemePreset.CYBERPUNK -> {
+                                        stringResource(R.string.theme_preset_cyberpunk)
                                     }
 
                                     ThemePreset.CUSTOM -> {
