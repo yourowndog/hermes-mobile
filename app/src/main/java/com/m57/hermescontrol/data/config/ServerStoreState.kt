@@ -18,6 +18,12 @@ data class ServerStoreState(
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
     val useDynamicColors: Boolean = false,
     val themePreset: ThemePreset = ThemePreset.DEFAULT,
+    /** Marketplace custom theme display name. Null when none applied. */
+    val customThemeName: String? = null,
+    /** Marketplace extension id of the applied custom theme. */
+    val customThemeId: String? = null,
+    /** Marketplace custom theme variants as JSON. Restored on startup. */
+    val customThemeTokensJson: String? = null,
     val connectionProfiles: List<ConnectionProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val pinnedModels: List<PinnedModel> = emptyList(),
@@ -26,6 +32,9 @@ data class ServerStoreState(
     val busySendMode: BusySendMode = BusySendMode.CORRECT,
     val typingEffectDelayMs: Int = 30,
     val chatFontScale: Float = 1.0f,
+    /** Selected font family key matching [com.m57.hermescontrol.theme.AppFontFamily.key].
+     *  "system" by default. Stored as a String for forward compatibility. */
+    val chatFontFamily: String = "system",
     val messageStatsEnabled: Boolean = false,
     val showUserMessageTokens: Boolean = true,
     val showAssistantMessageTokens: Boolean = true,

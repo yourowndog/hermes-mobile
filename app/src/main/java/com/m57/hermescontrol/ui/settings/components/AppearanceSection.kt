@@ -1,6 +1,5 @@
 package com.m57.hermescontrol.ui.settings.components
 
-import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,6 +21,7 @@ import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -39,11 +39,12 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.model.BusySendMode
+import com.m57.hermescontrol.theme.AppFontFamily
 import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
-import com.m57.hermescontrol.theme.ThemeRegistry
 import com.m57.hermescontrol.ui.chat.label
 import com.m57.hermescontrol.ui.settings.SectionCard
+import com.m57.hermescontrol.ui.thememarketplace.ThemeMarketplaceRecoveryBanner
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -55,9 +56,23 @@ internal fun AppearanceSection(
     onUseDynamicColorsChange: (Boolean) -> Unit,
     themePreset: ThemePreset,
     onThemePresetChange: (ThemePreset) -> Unit,
+    chatFontFamily: String,
+    onChatFontFamilyChange: (String) -> Unit,
+    customThemeUnavailable: Boolean = false,
+    unavailableThemeName: String? = null,
+    onReapplyCustomTheme: () -> Unit = {},
+    onClearCustomTheme: () -> Unit = {},
 ) {
-    val dynamicAvailable = useDynamicColors && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
     SectionCard {
+        if (customThemeUnavailable) {
+            ThemeMarketplaceRecoveryBanner(
+                themeName = unavailableThemeName,
+                onReapply = onReapplyCustomTheme,
+                onClear = onClearCustomTheme,
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
         Text(
             text = stringResource(R.string.settings_item_theme),
             style = MaterialTheme.typography.bodyLarge,
@@ -108,6 +123,11 @@ internal fun AppearanceSection(
             Switch(
                 checked = useDynamicColors,
                 onCheckedChange = onUseDynamicColorsChange,
+                colors =
+                    SwitchDefaults.colors(
+                        checkedThumbColor = MaterialTheme.colorScheme.primary,
+                        checkedTrackColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
             )
         }
 
@@ -119,30 +139,86 @@ internal fun AppearanceSection(
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        if (dynamicAvailable) {
-            Text(
-                text = stringResource(R.string.settings_desc_theme_preset_dynamic),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-
         var presetsExpanded by remember { mutableStateOf(false) }
         Box(modifier = Modifier.fillMaxWidth()) {
             OutlinedButton(
                 onClick = { presetsExpanded = true },
+                enabled = !useDynamicColors,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(themePreset.label())
+                Text(
+                    when (themePreset) {
+                        ThemePreset.DEFAULT -> stringResource(R.string.theme_preset_default)
+                        ThemePreset.MONOCHROME -> stringResource(R.string.theme_preset_monochrome)
+                        ThemePreset.GRUVBOX -> stringResource(R.string.theme_preset_gruvbox)
+                        ThemePreset.CATPPUCCIN -> stringResource(R.string.theme_preset_catppuccin)
+                        ThemePreset.AMOLED -> stringResource(R.string.theme_preset_amoled)
+                        ThemePreset.NORD -> stringResource(R.string.theme_preset_nord)
+                        ThemePreset.GARNET -> stringResource(R.string.theme_preset_garnet)
+                        ThemePreset.CUSTOM -> stringResource(R.string.theme_preset_custom)
+                    },
+                )
             }
             DropdownMenu(
                 expanded = presetsExpanded,
                 onDismissRequest = { presetsExpanded = false },
                 modifier = Modifier.fillMaxWidth(0.85f),
             ) {
-                ThemeRegistry.forEach { (preset, _) ->
+                ThemePreset.entries.forEach { preset ->
                     DropdownMenuItem(
-                        text = { Text(preset.label()) },
+                        text = {
+                            Text(
+                                when (preset) {
+                                    ThemePreset.DEFAULT -> {
+                                        stringResource(
+                                            R.string.theme_preset_default,
+                                        )
+                                    }
+
+                                    ThemePreset.MONOCHROME -> {
+                                        stringResource(
+                                            R.string.theme_preset_monochrome,
+                                        )
+                                    }
+
+                                    ThemePreset.GRUVBOX -> {
+                                        stringResource(
+                                            R.string.theme_preset_gruvbox,
+                                        )
+                                    }
+
+                                    ThemePreset.CATPPUCCIN -> {
+                                        stringResource(
+                                            R.string.theme_preset_catppuccin,
+                                        )
+                                    }
+
+                                    ThemePreset.AMOLED -> {
+                                        stringResource(
+                                            R.string.theme_preset_amoled,
+                                        )
+                                    }
+
+                                    ThemePreset.NORD -> {
+                                        stringResource(
+                                            R.string.theme_preset_nord,
+                                        )
+                                    }
+
+                                    ThemePreset.GARNET -> {
+                                        stringResource(
+                                            R.string.theme_preset_garnet,
+                                        )
+                                    }
+
+                                    ThemePreset.CUSTOM -> {
+                                        stringResource(
+                                            R.string.theme_preset_custom,
+                                        )
+                                    }
+                                },
+                            )
+                        },
                         onClick = {
                             onThemePresetChange(preset)
                             presetsExpanded = false
@@ -152,21 +228,51 @@ internal fun AppearanceSection(
             }
         }
     }
-}
 
-@Composable
-private fun ThemePreset.label(): String =
-    stringResource(
-        when (this) {
-            ThemePreset.DEFAULT -> R.string.theme_preset_default
-            ThemePreset.MONOCHROME -> R.string.theme_preset_monochrome
-            ThemePreset.GRUVBOX -> R.string.theme_preset_gruvbox
-            ThemePreset.CATPPUCCIN -> R.string.theme_preset_catppuccin
-            ThemePreset.AMOLED -> R.string.theme_preset_amoled
-            ThemePreset.NORD -> R.string.theme_preset_nord
-            ThemePreset.GARNET -> R.string.theme_preset_garnet
-        },
+    Spacer(modifier = Modifier.height(16.dp))
+
+    Text(
+        text = stringResource(R.string.settings_item_chat_font_family),
+        style = MaterialTheme.typography.bodyLarge,
     )
+    Text(
+        text = stringResource(R.string.settings_desc_chat_font_family),
+        style =
+            MaterialTheme.typography.bodySmall.copy(
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+
+    var fontFamilyExpanded by remember { mutableStateOf(false) }
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { fontFamilyExpanded = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                AppFontFamily.entries.first { it.key == chatFontFamily }.displayName,
+            )
+        }
+        DropdownMenu(
+            expanded = fontFamilyExpanded,
+            onDismissRequest = { fontFamilyExpanded = false },
+            modifier = Modifier.fillMaxWidth(0.85f),
+        ) {
+            AppFontFamily.entries.forEach { font ->
+                DropdownMenuItem(
+                    text = {
+                        Text(font.displayName)
+                    },
+                    onClick = {
+                        onChatFontFamilyChange(font.key)
+                        fontFamilyExpanded = false
+                    },
+                )
+            }
+        }
+    }
+}
 
 @Composable
 internal fun ChatSection(
@@ -454,6 +560,11 @@ internal fun ChatSection(
                 checked = showModelProvider,
                 onCheckedChange = onShowModelProviderChange,
                 modifier = Modifier.testTag("settings_show_model_provider"),
+                colors =
+                    SwitchDefaults.colors(
+                        checkedThumbColor = MaterialTheme.colorScheme.primary,
+                        checkedTrackColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
             )
         }
 
@@ -480,6 +591,11 @@ internal fun ChatSection(
             Switch(
                 checked = typingEffectEnabled,
                 onCheckedChange = onTypingEffectEnabledChange,
+                colors =
+                    SwitchDefaults.colors(
+                        checkedThumbColor = MaterialTheme.colorScheme.primary,
+                        checkedTrackColor = MaterialTheme.colorScheme.primaryContainer,
+                    ),
             )
         }
 

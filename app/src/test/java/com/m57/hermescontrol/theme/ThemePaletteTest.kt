@@ -24,7 +24,13 @@ import java.lang.reflect.Modifier
 class ThemePaletteTest {
     @Test
     fun registryCoversEveryPresetExactlyOnce() {
-        assertEquals(ThemePreset.entries, ThemeRegistry.map { it.preset })
+        // CUSTOM is deliberately absent from the static registry: it resolves a
+        // marketplace-applied palette at runtime (see Theme.palette()/themeFor)
+        // and is not a fixed one-file theme, so it has no registry entry.
+        assertEquals(
+            ThemePreset.entries.filter { it != ThemePreset.CUSTOM },
+            ThemeRegistry.map { it.preset },
+        )
     }
 
     @Test

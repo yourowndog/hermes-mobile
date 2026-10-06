@@ -20,6 +20,7 @@ import com.m57.hermescontrol.data.remote.CookieManager
 import com.m57.hermescontrol.data.remote.ServerEndpoint
 import com.m57.hermescontrol.data.remote.ServerHeaders
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
+import com.m57.hermescontrol.data.theme.import.ThemeApplier
 import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
 import kotlinx.coroutines.CancellationException
@@ -82,6 +83,9 @@ object AuthManager {
 
     private val _chatFontScaleFlow = MutableStateFlow<Float>(1.0f)
     val chatFontScaleFlow: StateFlow<Float> = _chatFontScaleFlow.asStateFlow()
+
+    private val _fontFamilyFlow = MutableStateFlow<String>("system")
+    val fontFamilyFlow: StateFlow<String> = _fontFamilyFlow.asStateFlow()
 
     private val _tokenFlow = MutableStateFlow<String?>(null)
     val tokenFlow: StateFlow<String?> = _tokenFlow.asStateFlow()
@@ -236,12 +240,21 @@ object AuthManager {
                         _useDynamicColorsFlow.value = state.useDynamicColors
                         _themePresetFlow.value = state.themePreset
                         _chatFontScaleFlow.value = state.chatFontScale
+                        _fontFamilyFlow.value = state.chatFontFamily
+                        // Restore a persisted marketplace theme so
+                        // ThemePreset.CUSTOM resolves after process restart.
+                        ThemeApplier.restorePersisted(
+                            state.customThemeId,
+                            state.customThemeName,
+                            state.customThemeTokensJson,
+                        )
                         scope.launch {
                             store.stateFlow.collect { latest ->
                                 _themePreferenceFlow.value = latest.themePreference
                                 _useDynamicColorsFlow.value = latest.useDynamicColors
                                 _themePresetFlow.value = latest.themePreset
                                 _chatFontScaleFlow.value = latest.chatFontScale
+                                _fontFamilyFlow.value = latest.chatFontFamily
                                 syncCookieStoreForProfile(latest.selectedProfileId)
                             }
                         }
@@ -884,6 +897,15 @@ object AuthManager {
     fun setChatFontScale(scale: Float) {
         serverStore.update { it.copy(chatFontScale = scale) }
         _chatFontScaleFlow.value = scale
+    }
+
+    // ── Chat Font Family ────────────────────────────────────────────────
+
+    fun getChatFontFamily(): String = serverStore.getLatestState().chatFontFamily
+
+    fun setChatFontFamily(fontFamily: String) {
+        serverStore.update { it.copy(chatFontFamily = fontFamily) }
+        _fontFamilyFlow.value = fontFamily
     }
 
     // ── In-app update check (issue #867) ─────────────────────────────────
