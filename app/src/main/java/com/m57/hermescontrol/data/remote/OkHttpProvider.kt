@@ -32,7 +32,9 @@ object OkHttpProvider {
     val base: OkHttpClient by lazy {
         OkHttpClient
             .Builder()
+            .let(ClientCertificates::configure)
             .cookieJar(resolveCookieJar())
+            .addNetworkInterceptor(ServerHeadersInterceptor())
             .connectionPool(connectionPool)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
@@ -48,6 +50,9 @@ object OkHttpProvider {
             .cookieJar(resolveCookieJar())
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(30, TimeUnit.SECONDS)
+            .addInterceptor(ServerHeadersInterceptor())
+            .followRedirects(false)
+            .followSslRedirects(false)
             .build()
     }
 

@@ -1,12 +1,28 @@
 package com.m57.hermescontrol.ui.chat
 
 import com.m57.hermescontrol.data.model.ConnectionOperationSnapshot
+import com.m57.hermescontrol.data.model.ConnectorError
+import com.m57.hermescontrol.data.ws.ConnectorParser
 import com.m57.hermescontrol.data.ws.HermesWsClient
-import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.data.ws.contract.ConnectionAnswer
+import com.m57.hermescontrol.data.ws.contract.ConnectionAnswerTarget
+import com.m57.hermescontrol.data.ws.contract.ConnectionRespondParams
+import com.m57.hermescontrol.data.ws.contract.ConnectorOwner
+import com.m57.hermescontrol.data.ws.contract.ConnectorsOperationStatusParams
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+
+sealed interface ConnectionOperationRequest {
+    data class Respond(
+        val params: ConnectionRespondParams,
+    ) : ConnectionOperationRequest
+
+    data class Wake(
+        val params: ConnectorsOperationStatusParams,
+    ) : ConnectionOperationRequest
+}
 
 sealed class ConnectionPendingAction {
     abstract val opId: String
@@ -42,10 +58,7 @@ data class ConnectionOperationUiState(
 )
 
 fun interface ConnectionOperationRequester {
-    suspend fun request(
-        method: String,
-        params: Map<String, Any>,
-    ): Any?
+    suspend fun request(action: ConnectionOperationRequest): Any?
 }
 
 internal class ConnectionResumeCheckpoint(
@@ -57,7 +70,10 @@ internal class ConnectionResumeCheckpoint(
 /** Session-scoped authoritative reducer for backend-owned connector operations. */
 class ChatConnectionOperationDelegate(
     private val requester: ConnectionOperationRequester,
+    private val accountOwned: Boolean,
 ) {
+    constructor(requester: ConnectionOperationRequester) : this(requester, false)
+
     private val _state = MutableStateFlow(ConnectionOperationUiState())
     val state: StateFlow<ConnectionOperationUiState> = _state.asStateFlow()
     private var sessionId: String? = null
@@ -157,19 +173,20 @@ class ChatConnectionOperationDelegate(
                     observedSeq = current.seq,
                 ),
             ) ?: return
-        val answer =
-            buildMap<String, Any> {
-                put("name", target)
-                put("status", if (approved) "approved" else "skipped")
-                if (safeEnv.isNotEmpty()) put("env", safeEnv)
-            }
+        val answerTarget =
+            ConnectionAnswerTarget(
+                name = target,
+                status = if (approved) "approved" else "skipped",
+                env = safeEnv.takeIf { it.isNotEmpty() },
+            )
         dispatch(
-            method = WsMethods.CONNECTION_RESPOND,
-            params =
-                mapOf(
-                    "session_id" to requireSessionId(),
-                    "op_id" to snapshot.opId,
-                    "result" to mapOf("targets" to listOf(answer)),
+            action =
+                ConnectionOperationRequest.Respond(
+                    ConnectionRespondParams(
+                        owner = owner(),
+                        opId = snapshot.opId,
+                        result = ConnectionAnswer(targets = listOf(answerTarget)),
+                    ),
                 ),
         )
     }
@@ -177,12 +194,13 @@ class ChatConnectionOperationDelegate(
     suspend fun continueOperation() {
         val snapshot = begin(ConnectionPendingAction.Continue(currentOp(), currentSeq())) ?: return
         dispatch(
-            method = WsMethods.CONNECTION_RESPOND,
-            params =
-                mapOf(
-                    "session_id" to requireSessionId(),
-                    "op_id" to snapshot.opId,
-                    "result" to mapOf("settled_by" to "continue"),
+            action =
+                ConnectionOperationRequest.Respond(
+                    ConnectionRespondParams(
+                        owner = owner(),
+                        opId = snapshot.opId,
+                        result = ConnectionAnswer(settledBy = "continue"),
+                    ),
                 ),
         )
     }
@@ -192,40 +210,44 @@ class ChatConnectionOperationDelegate(
         if (current.opId != expectedOpId) return
         val snapshot = begin(ConnectionPendingAction.Wake(current.opId, current.seq)) ?: return
         dispatch(
-            method = WsMethods.CONNECTORS_OPERATION_WAKE,
-            params = mapOf("session_id" to requireSessionId(), "op_id" to snapshot.opId),
+            action =
+                ConnectionOperationRequest.Wake(
+                    ConnectorsOperationStatusParams(
+                        owner = owner(),
+                        opId = snapshot.opId,
+                    ),
+                ),
             clearOnSuccess = true,
             unknownOperationSettles = true,
         )
     }
 
     private suspend fun dispatch(
-        method: String,
-        params: Map<String, Any>,
+        action: ConnectionOperationRequest,
         clearOnSuccess: Boolean = false,
         unknownOperationSettles: Boolean = false,
     ) {
-        val action = _state.value.pendingAction
+        val pending = _state.value.pendingAction
         val actionGeneration = generation
         try {
-            requester.request(method, params)
+            requester.request(action)
             // Success only acknowledges receipt. Keep the exactly-once lock until
             // a newer authoritative snapshot advances the operation sequence.
-            if (clearOnSuccess && generation == actionGeneration && _state.value.pendingAction == action) {
+            if (clearOnSuccess && generation == actionGeneration && _state.value.pendingAction == pending) {
                 _state.value = _state.value.copy(pendingAction = null)
             }
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             if (unknownOperationSettles && error is HermesWsClient.HermesRpcException && error.code == 4004) {
-                if (generation == actionGeneration && _state.value.pendingAction == action) {
-                    action?.opId?.let(::markSettled)
+                if (generation == actionGeneration && _state.value.pendingAction == pending) {
+                    pending?.opId?.let(::markSettled)
                 }
-            } else if (generation == actionGeneration && _state.value.pendingAction == action) {
+            } else if (generation == actionGeneration && _state.value.pendingAction == pending) {
                 _state.value =
                     _state.value.copy(
                         pendingAction = null,
-                        error = ConnectionOperationError("request_failed"),
+                        error = operationError(error),
                     )
             }
         }
@@ -234,7 +256,7 @@ class ChatConnectionOperationDelegate(
     @Synchronized
     private fun begin(action: ConnectionPendingAction): ConnectionOperationSnapshot? {
         val current = _state.value.operation ?: return null
-        if (sessionId.isNullOrBlank() ||
+        if ((!accountOwned && sessionId.isNullOrBlank()) ||
             _state.value.pendingAction != null ||
             current.opId != action.opId ||
             current.seq != action.observedSeq
@@ -245,10 +267,26 @@ class ChatConnectionOperationDelegate(
         return current
     }
 
-    private fun matchesSession(snapshot: ConnectionOperationSnapshot): Boolean =
-        !sessionId.isNullOrBlank() && snapshot.sessionId == sessionId
+    /** Typed, sanitized error: ownership/runtime failures cannot succeed on retry (#1281). */
+    private fun operationError(error: Exception): ConnectionOperationError {
+        val rpc = error as? HermesWsClient.HermesRpcException ?: return ConnectionOperationError(REQUEST_FAILED)
+        return when (ConnectorParser.mapRpcError(code = rpc.code, data = rpc.data)) {
+            is ConnectorError.NotOwner -> ConnectionOperationError(NOT_OWNER, retryable = false)
+            is ConnectorError.UnsupportedRuntime -> ConnectionOperationError(UNSUPPORTED_RUNTIME, retryable = false)
+            else -> ConnectionOperationError(REQUEST_FAILED)
+        }
+    }
 
-    private fun requireSessionId(): String = checkNotNull(sessionId?.takeIf { it.isNotBlank() })
+    private fun matchesSession(snapshot: ConnectionOperationSnapshot): Boolean =
+        if (accountOwned) {
+            snapshot.accountOwned
+        } else {
+            !snapshot.accountOwned && !sessionId.isNullOrBlank() &&
+                snapshot.sessionId == sessionId
+        }
+
+    private fun owner(): ConnectorOwner =
+        if (accountOwned) ConnectorOwner.account() else ConnectorOwner.session(checkNotNull(sessionId))
 
     private fun currentOp(): String =
         _state.value.operation
@@ -263,7 +301,10 @@ class ChatConnectionOperationDelegate(
         _state.value = ConnectionOperationUiState()
     }
 
-    private companion object {
-        const val MAX_SETTLED_IDS = 32
+    companion object {
+        private const val MAX_SETTLED_IDS = 32
+        const val REQUEST_FAILED = "request_failed"
+        const val NOT_OWNER = "not_owner"
+        const val UNSUPPORTED_RUNTIME = "unsupported_runtime"
     }
 }

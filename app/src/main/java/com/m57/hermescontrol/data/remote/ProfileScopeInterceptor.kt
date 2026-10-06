@@ -26,6 +26,17 @@ object ProfileScopeInterceptor : Interceptor {
     private val PROFILE_SCOPED_PREFIXES =
         listOf(
             "/api/analytics",
+            // Voice-note transcription resolves STT through the profile's
+            // configured provider, so the request must carry the active
+            // profile (the desktop sends this route `...profileScoped()`;
+            // hermes_cli/web_routers/audio.py is config-scoped). Unscoped, a
+            // multi-profile host transcribes under the launch profile
+            // (review, PR #1250).
+            "/api/audio",
+            // Curator state is per profile (config-scoped reads) and the run
+            // trigger is privileged: `POST /api/curator/run` is refused with
+            // 400 on a multi-profile backend without ?profile=.
+            "/api/curator",
             "/api/config",
             "/api/credentials/pool",
             "/api/cron",

@@ -1,5 +1,6 @@
 package com.m57.hermescontrol.data.config
 
+import com.m57.hermescontrol.data.model.BusySendMode
 import com.m57.hermescontrol.data.model.PinnedModel
 import com.m57.hermescontrol.theme.ThemePreference
 import com.m57.hermescontrol.theme.ThemePreset
@@ -17,19 +18,32 @@ data class ServerStoreState(
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
     val useDynamicColors: Boolean = false,
     val themePreset: ThemePreset = ThemePreset.DEFAULT,
+    /** Marketplace custom theme display name. Null when none applied. */
+    val customThemeName: String? = null,
+    /** Marketplace extension id of the applied custom theme. */
+    val customThemeId: String? = null,
+    /** Marketplace custom theme variants as JSON. Restored on startup. */
+    val customThemeTokensJson: String? = null,
     val connectionProfiles: List<ConnectionProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val pinnedModels: List<PinnedModel> = emptyList(),
     val wsAuthParam: String = "token",
     val typingEffectEnabled: Boolean = true,
+    val busySendMode: BusySendMode = BusySendMode.CORRECT,
     val typingEffectDelayMs: Int = 30,
     val chatFontScale: Float = 1.0f,
+    /** Selected font family key matching [com.m57.hermescontrol.theme.AppFontFamily.key].
+     *  "system" by default. Stored as a String for forward compatibility. */
+    val chatFontFamily: String = "system",
     val messageStatsEnabled: Boolean = false,
     val showUserMessageTokens: Boolean = true,
     val showAssistantMessageTokens: Boolean = true,
     val showTokensPerSecond: Boolean = true,
     val showModelProvider: Boolean = false,
     val keepConnectedInBackground: Boolean = false,
+    // Notify when ANY session finishes while the app is backgrounded. Needs a
+    // live background connection, so it implies the keep-connected lease.
+    val notifySessionCompletions: Boolean = false,
     // Opt-in update channel: when true the in-app update check also considers
     // pre-release release-candidate GitHub releases, not just stable ones.
     val checkReleaseCandidateUpdates: Boolean = false,

@@ -66,33 +66,87 @@ object MarkdownInlineStyler {
         return buildAnnotatedString {
             var i = 0
             val src = text
+
             while (i < src.length) {
+                // Cheap prefix gate: URL_PATTERN only matches at "http(s)://", so skip the regex elsewhere.
+                val urlMatch =
+                    if (src.startsWith("http", i, ignoreCase = true)) URL_PATTERN.matchAt(src, i) else null
                 when {
-                    // ***bold italic***
-                    src.startsWith("***", i) -> {
-                        val end = src.indexOf("***", i + 3)
-                        if (end != -1) {
-                            val raw = src.substring(i + 3, end)
-                            val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
-                            withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
-                                append(toAppend)
+                    // Inline code is opaque to emphasis parsing, and delimiters must match by run length.
+                    src[i] == '`' -> {
+                        var runEnd = i
+                        while (runEnd < src.length && src[runEnd] == '`') runEnd++
+                        val runLength = runEnd - i
+                        var end = runEnd
+                        var matchingEnd = -1
+                        while (end < src.length) {
+                            if (src[end] == '`') {
+                                var candidateEnd = end
+                                while (candidateEnd < src.length && src[candidateEnd] == '`') candidateEnd++
+                                if (candidateEnd - end == runLength) {
+                                    matchingEnd = end
+                                    break
+                                }
+                                end = candidateEnd
+                            } else {
+                                end++
                             }
-                            i = end + 3
+                        }
+                        if (matchingEnd >= 0) {
+                            val raw = src.substring(runEnd, matchingEnd)
+                            val content = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
+                            withStyle(
+                                SpanStyle(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 13.sp,
+                                    background = textColor.copy(alpha = 0.08f),
+                                ),
+                            ) {
+                                appendSearchable(content, searchQuery, searchHighlightColor)
+                            }
+                            i = matchingEnd + runLength
                         } else {
-                            append(src[i])
-                            i++
+                            append(src.substring(i, runEnd))
+                            i = runEnd
                         }
                     }
 
-                    // **bold**
+                    // Combined / nested emphasis delimiters.
+                    src.startsWith("***", i) -> {
+                        val end = src.indexOf("***", i + 3)
+                        if (end >= 0) {
+                            val raw = src.substring(i + 3, end)
+                            val content = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
+                            withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
+                                appendSearchable(content, searchQuery, searchHighlightColor)
+                            }
+                            i = end + 3
+                        } else {
+                            append("***")
+                            i += 3
+                        }
+                    }
+
                     src.startsWith("**", i) -> {
-                        val end = src.indexOf("**", i + 2)
+                        var end = src.indexOf("**", i + 2)
+                        if (end >= 0 && src.startsWith("***", end) &&
+                            src.substring(i + 2, end).count { it == '*' } % 2 == 1
+                        ) {
+                            end++ // Inner italic closes with the first star of the trailing run.
+                        }
                         if (end != -1) {
                             val raw = src.substring(i + 2, end)
-                            val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
-                            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                                append(toAppend)
-                            }
+                            val nested =
+                                parseInlineSource(
+                                    raw,
+                                    textColor,
+                                    searchQuery,
+                                    isCurrentMatch,
+                                    linkColor,
+                                    highlights,
+                                    isRtl,
+                                )
+                            withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(nested) }
                             i = end + 2
                         } else {
                             append(src[i])
@@ -107,7 +161,7 @@ object MarkdownInlineStyler {
                             val raw = src.substring(i + 2, end)
                             val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
                             withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
-                                append(toAppend)
+                                appendSearchable(toAppend, searchQuery, searchHighlightColor)
                             }
                             i = end + 2
                         } else {
@@ -116,16 +170,24 @@ object MarkdownInlineStyler {
                         }
                     }
 
-                    // *italic*
+                    // *italic*; bold spans keep their styles while nested text is appended.
                     src.startsWith("*", i) -> {
-                        val end = src.indexOf('*', i + 1)
-                        if (end != -1 && end > i + 1) {
-                            val raw = src.substring(i + 1, end)
-                            val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
-                            withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                                append(toAppend)
-                            }
-                            i = end + 1
+                        val close = src.indexOf('*', i + 1)
+                        if (close > i + 1) {
+                            val raw = src.substring(i + 1, close)
+                            val italic = SpanStyle(fontStyle = FontStyle.Italic)
+                            val nested =
+                                parseInlineSource(
+                                    raw,
+                                    textColor,
+                                    searchQuery,
+                                    isCurrentMatch,
+                                    linkColor,
+                                    highlights,
+                                    isRtl,
+                                )
+                            withStyle(italic) { append(nested) }
+                            i = close + 1
                         } else {
                             append(src[i])
                             i++
@@ -139,7 +201,7 @@ object MarkdownInlineStyler {
                             val raw = src.substring(i + 2, end)
                             val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
                             withStyle(SpanStyle(background = highlights.markupBackground)) {
-                                append(toAppend)
+                                appendSearchable(toAppend, searchQuery, searchHighlightColor)
                             }
                             i = end + 2
                         } else {
@@ -153,7 +215,7 @@ object MarkdownInlineStyler {
                         val end = src.indexOf('^', i + 1)
                         if (end != -1 && end > i + 1) {
                             withStyle(SpanStyle(baselineShift = BaselineShift.Superscript)) {
-                                append(src.substring(i + 1, end))
+                                appendSearchable(src.substring(i + 1, end), searchQuery, searchHighlightColor)
                             }
                             i = end + 1
                         } else {
@@ -167,7 +229,7 @@ object MarkdownInlineStyler {
                         val end = src.indexOf('~', i + 1)
                         if (end != -1 && end > i + 1) {
                             withStyle(SpanStyle(baselineShift = BaselineShift.Subscript)) {
-                                append(src.substring(i + 1, end))
+                                appendSearchable(src.substring(i + 1, end), searchQuery, searchHighlightColor)
                             }
                             i = end + 1
                         } else {
@@ -188,7 +250,7 @@ object MarkdownInlineStyler {
                                     background = textColor.copy(alpha = 0.12f),
                                 ),
                             ) {
-                                append(toAppend)
+                                appendSearchable(toAppend, searchQuery, searchHighlightColor)
                             }
                             i = end + 6
                         } else {
@@ -225,16 +287,20 @@ object MarkdownInlineStyler {
                             val urlEnd = src.indexOf(')', close + 2)
                             if (urlEnd != -1) {
                                 val label = src.substring(i + 1, close)
-                                val labelToAppend = if (isRtl) BidiUtils.wrapLtrIsolate(label) else label
                                 val url = src.substring(close + 2, urlEnd)
                                 pushLink(LinkAnnotation.Url(url))
-                                withStyle(
-                                    SpanStyle(
-                                        color = linkColor,
-                                        textDecoration = TextDecoration.Underline,
-                                    ),
-                                ) {
-                                    append(labelToAppend)
+                                val labelText =
+                                    parseInlineSource(
+                                        label,
+                                        textColor,
+                                        searchQuery,
+                                        isCurrentMatch,
+                                        linkColor,
+                                        highlights,
+                                        isRtl,
+                                    )
+                                withStyle(SpanStyle(color = linkColor, textDecoration = TextDecoration.Underline)) {
+                                    append(labelText)
                                 }
                                 pop()
                                 i = urlEnd + 1
@@ -248,32 +314,9 @@ object MarkdownInlineStyler {
                         }
                     }
 
-                    // `inline code`
-                    src.startsWith("`", i) -> {
-                        val end = src.indexOf('`', i + 1)
-                        if (end != -1) {
-                            val raw = src.substring(i + 1, end)
-                            val toAppend = if (isRtl) BidiUtils.wrapLtrIsolate(raw) else raw
-                            withStyle(
-                                SpanStyle(
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 13.sp,
-                                    background = textColor.copy(alpha = 0.08f),
-                                ),
-                            ) {
-                                append(toAppend)
-                            }
-                            i = end + 1
-                        } else {
-                            append(src[i])
-                            i++
-                        }
-                    }
-
                     // bare URL
-                    URL_PATTERN.matchAt(src, i) != null -> {
-                        val match = URL_PATTERN.matchAt(src, i)!!
-                        val url = match.value
+                    urlMatch != null -> {
+                        val url = urlMatch.value
                         val urlToAppend = if (isRtl) BidiUtils.wrapLtrIsolate(url) else url
                         pushLink(LinkAnnotation.Url(url))
                         withStyle(
@@ -285,7 +328,7 @@ object MarkdownInlineStyler {
                             append(urlToAppend)
                         }
                         pop()
-                        i = match.range.last + 1
+                        i = urlMatch.range.last + 1
                     }
 
                     // Plain text / words in RTL
@@ -339,4 +382,27 @@ object MarkdownInlineStyler {
     }
 
     private fun isRtr(isRtl: Boolean): Boolean = isRtl
+
+    /** Append [text], highlighting every [query] hit so styled spans (inline code, sub/sup, ...) stay searchable. */
+    private fun AnnotatedString.Builder.appendSearchable(
+        text: String,
+        query: String,
+        highlight: Pair<Color, Color>,
+    ) {
+        if (query.isEmpty()) {
+            append(text)
+            return
+        }
+        var from = 0
+        while (from < text.length) {
+            val hit = text.indexOf(query, from, ignoreCase = true)
+            if (hit < 0) break
+            append(text.substring(from, hit))
+            withStyle(SpanStyle(background = highlight.first, color = highlight.second)) {
+                append(text.substring(hit, hit + query.length))
+            }
+            from = hit + query.length
+        }
+        append(text.substring(from))
+    }
 }

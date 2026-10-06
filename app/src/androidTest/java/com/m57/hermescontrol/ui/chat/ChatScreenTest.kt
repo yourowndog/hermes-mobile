@@ -4,12 +4,14 @@ import android.content.pm.PackageManager
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.core.content.ContextCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.MediumTest
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.ws.ConnectionStatus
+import com.m57.hermescontrol.ui.chat.fullbleed.TranscriptUiState
 import com.m57.hermescontrol.ui.common.ActionProgressController
 import io.mockk.every
 import io.mockk.mockk
@@ -60,6 +62,10 @@ class ChatScreenTest {
         every { mockViewModel.uiState } returns MutableStateFlow(uiState).asStateFlow()
         every { mockViewModel.streamingState } returns MutableStateFlow(StreamingState()).asStateFlow()
         every { mockViewModel.timelineState } returns MutableStateFlow(ChatTimelineState()).asStateFlow()
+        every { mockViewModel.transcriptState } returns
+            MutableStateFlow(
+                TranscriptUiState.resolve(uiState, ChatTimelineState(), StreamingState(), null, null),
+            ).asStateFlow()
         every { mockViewModel.connectionOperationState } returns
             MutableStateFlow(ConnectionOperationUiState()).asStateFlow()
         // ActionProgressDialog collects the controller's StateFlow — a relaxed
@@ -109,6 +115,10 @@ class ChatScreenTest {
         every { mockViewModel.uiState } returns MutableStateFlow(uiState).asStateFlow()
         every { mockViewModel.streamingState } returns MutableStateFlow(StreamingState()).asStateFlow()
         every { mockViewModel.timelineState } returns MutableStateFlow(ChatTimelineState()).asStateFlow()
+        every { mockViewModel.transcriptState } returns
+            MutableStateFlow(
+                TranscriptUiState.resolve(uiState, ChatTimelineState(), StreamingState(), null, null),
+            ).asStateFlow()
         every { mockViewModel.connectionOperationState } returns
             MutableStateFlow(ConnectionOperationUiState()).asStateFlow()
         every { mockViewModel.actionProgress } returns

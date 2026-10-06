@@ -13,6 +13,63 @@ import org.junit.Test
 
 class ChatPagingMergeTest {
     @Test
+    fun lateCachedRunningToolCannotReplaceCanonicalServerResult() {
+        val canonical =
+            ChatMessage(
+                id = "rest-s-42",
+                role = MessageRole.TOOL,
+                content = """{"output":"server result","exit_code":0}""",
+                toolCallId = "call-42",
+                toolStatus = ToolStatus.COMPLETED,
+            )
+        val cached =
+            ChatMessage(
+                id = "cached-tool",
+                role = MessageRole.TOOL,
+                content = """{"name":"terminal","args":{"command":"pwd"}}""",
+                toolName = "terminal",
+                toolCallId = "call-42",
+                toolStatus = ToolStatus.RUNNING,
+                isHistoricalCache = true,
+                tokenCount = 7,
+                tps = 2.5,
+                finishTimestamp = 123L,
+            )
+
+        val merged = mergeCachedTranscriptPage(listOf(cached), listOf(canonical)).single()
+
+        assertEquals(canonical.id, merged.id)
+        assertEquals(canonical.content, merged.content)
+        assertEquals(ToolStatus.COMPLETED, merged.toolStatus)
+        assertEquals("terminal", merged.toolName)
+        assertEquals("call-42", merged.toolCallId)
+        assertEquals(cached.tokenCount, merged.tokenCount)
+        assertEquals(cached.tps, merged.tps)
+        assertEquals(cached.finishTimestamp, merged.finishTimestamp)
+    }
+
+    @Test
+    fun canonicalResultSettlesHistoricalRunningToolWithServerOutput() {
+        val cached =
+            ChatMessage(
+                id = "old-tool",
+                role = MessageRole.TOOL,
+                content = """{"name":"terminal","args":{"command":"pwd"}}""",
+                toolName = "terminal",
+                toolCallId = "call-42",
+                toolStatus = ToolStatus.RUNNING,
+                isHistoricalCache = true,
+            )
+        val page = mapServerMessages("s", listOf(serverTool(42, "call-42")), 0, true, listOf(cached))
+        val merged = mergeTranscriptWithLive(page, listOf(cached), preserveLiveIds = true).single()
+        assertEquals(cached.id, merged.id)
+        assertEquals("rest-s-42", merged.canonicalRestId)
+        assertEquals(ToolStatus.COMPLETED, merged.toolStatus)
+        assertTrue(merged.content.contains("exit_code"))
+        assertTrue(!merged.isHistoricalCache)
+    }
+
+    @Test
     fun confirmedLiveOccurrenceCannotConsumeEarlierIdenticalPage() {
         for (role in listOf(MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL)) {
             val content = if (role == MessageRole.TOOL) "{\"output\":\"ok\"}" else "continue"
@@ -259,7 +316,7 @@ class ChatPagingMergeTest {
 
         val mapped = mapServerMessages("s", listOf(serverTool(42, "call-42")), 0, true, listOf(live, echo))
 
-        assertEquals(listOf(live.copy(restId = "rest-s-42")), mapped)
+        assertEquals(listOf(live.copy(restId = "rest-s-42", serverRowId = 42L)), mapped)
     }
 
     @Test
@@ -271,7 +328,10 @@ class ChatPagingMergeTest {
         val mapped = mapServerMessages("s", listOf(serverTool(42), serverTool(43)), 0, true, cache)
 
         assertEquals(
-            listOf(first.copy(restId = "rest-s-42"), second.copy(restId = "rest-s-43")),
+            listOf(
+                first.copy(restId = "rest-s-42", serverRowId = 42L),
+                second.copy(restId = "rest-s-43", serverRowId = 43L),
+            ),
             mapped,
         )
         assertEquals(2, mapped.map { it.id }.toSet().size)
@@ -599,6 +659,50 @@ class ChatPagingMergeTest {
     }
 
     @Test
+    fun verifierFooterReplyMatchesCanonicalCounterpartWithoutFooter() {
+        val footer =
+            """
+            ⚠️ File-mutation verifier: 1 file edit(s) FAILED this turn despite any wording above that may suggest otherwise. Run git status or read_file to confirm what actually landed.
+              • /tmp/skill_lang_audit.py — [write_file] Write denied: '/tmp/skill_lang_audit.py' is outside HERMES_WRITE_SAFE_ROOT (/opt/data). Unset the variable or add this path's directory prefix.
+            """.trimIndent()
+        val body = "I completed the audit. Here are the findings."
+        val liveAssistant =
+            ChatMessage(
+                id = "uuid-123",
+                role = MessageRole.ASSISTANT,
+                content = "$body\n\n$footer",
+                completionId = "comp-1",
+            )
+        val serverRow =
+            SessionMessage(
+                id = 42,
+                role = "assistant",
+                content = JsonPrimitive(body),
+            )
+
+        // 1. mapServerMessages correctly matches liveAssistant and acquires comp-1 and rich footer content
+        val mapped = mapServerMessages("session", listOf(serverRow), 0, true, listOf(liveAssistant))
+        assertEquals(1, mapped.size)
+        val canonical = mapped.single()
+        assertEquals("rest-session-42", canonical.id)
+        assertEquals("comp-1", canonical.completionId)
+        assertTrue("Canonical mapped row should retain verifier footer", canonical.content.contains(footer))
+
+        // 2. mergeTranscriptWithLive merges into a single message preserving footer and acquiring restId
+        val merged =
+            mergeTranscriptWithLive(
+                restMessages = mapped,
+                currentMessages = listOf(liveAssistant),
+                preserveLiveIds = true,
+            )
+        assertEquals(1, merged.size)
+        val single = merged.single()
+        assertEquals("uuid-123", single.id)
+        assertEquals("rest-session-42", single.restId)
+        assertTrue("Merged message must keep the verifier warning footer", single.content.contains(footer))
+    }
+
+    @Test
     fun permanentlyLocalRowsDoNotMatchCanonicalRowsByContent() {
         val localFeedback =
             ChatMessage(
@@ -848,6 +952,100 @@ class ChatPagingMergeTest {
         )
     }
 
+    private fun laterTurnRows(assistantText: String) =
+        listOf(
+            SessionMessage(
+                id = 0,
+                role = "user",
+                content = JsonPrimitive("long running task"),
+                timestamp = JsonPrimitive(1),
+            ),
+            SessionMessage(
+                id = 1,
+                role = "assistant",
+                content = JsonPrimitive(assistantText),
+                timestamp = JsonPrimitive(2),
+            ),
+            SessionMessage(
+                id = 2,
+                role = "user",
+                content = JsonPrimitive("next question"),
+                timestamp = JsonPrimitive(3),
+            ),
+            SessionMessage(
+                id = 3,
+                role = "assistant",
+                content = JsonPrimitive("next answer"),
+                timestamp = JsonPrimitive(4),
+            ),
+        )
+
+    @Test
+    fun stopNoticesStayInPlaceWhenInterruptedReplyIsStillLiveOnly() {
+        val prompt = ChatMessage(id = "rest-session-0", role = MessageRole.USER, content = "long running task")
+        val liveReply = ChatMessage(id = "live-reply", role = MessageRole.ASSISTANT, content = "Working on it...")
+        val stop = ChatMessage(id = "uuid-stop", role = MessageRole.USER, content = "/stop")
+        val processes =
+            ChatMessage(id = "uuid-procs", role = MessageRole.SYSTEM, content = "Stopped 2 background processes.")
+        val interrupted = ChatMessage(id = "uuid-int", role = MessageRole.SYSTEM, content = "Session interrupted")
+
+        val merged =
+            applyServerPage(listOf(prompt, liveReply, stop, processes, interrupted), laterTurnRows("Working on it..."))
+
+        assertEquals(
+            listOf(
+                "rest-session-0",
+                "rest-session-1",
+                "uuid-stop",
+                "uuid-procs",
+                "uuid-int",
+                "rest-session-2",
+                "rest-session-3",
+            ),
+            merged.map { it.canonicalRestId ?: it.id },
+        )
+    }
+
+    @Test
+    fun stopNoticesStayInPlaceWhenLongInterruptedReplyIsAPrefixOfTheServerCopy() {
+        val long = "Working on the migration plan step by step, first the schema then the data"
+        val prompt = ChatMessage(id = "rest-session-0", role = MessageRole.USER, content = "long running task")
+        val liveReply = ChatMessage(id = "live-reply", role = MessageRole.ASSISTANT, content = long)
+        val stop = ChatMessage(id = "uuid-stop", role = MessageRole.USER, content = "/stop")
+        val interrupted = ChatMessage(id = "uuid-int", role = MessageRole.SYSTEM, content = "Session interrupted")
+
+        val merged = applyServerPage(listOf(prompt, liveReply, stop, interrupted), laterTurnRows("$long, then indexes"))
+
+        val ids = merged.map { it.canonicalRestId ?: it.id }
+        assertTrue("notices before later turns: $ids", ids.indexOf("uuid-int") < ids.indexOf("rest-session-2"))
+    }
+
+    @Test
+    fun processResultArrivingAfterInterruptNoticeStaysBeforeLaterTurns() {
+        val prompt = ChatMessage(id = "rest-session-0", role = MessageRole.USER, content = "long running task")
+        val reply = ChatMessage(id = "rest-session-1", role = MessageRole.ASSISTANT, content = "Working on it...")
+        val stop = ChatMessage(id = "uuid-stop", role = MessageRole.USER, content = "/stop")
+        val interrupted = ChatMessage(id = "uuid-int", role = MessageRole.SYSTEM, content = "Session interrupted")
+        val processes =
+            ChatMessage(id = "uuid-procs", role = MessageRole.SYSTEM, content = "No background processes to stop.")
+
+        val merged =
+            applyServerPage(listOf(prompt, reply, stop, interrupted, processes), laterTurnRows("Working on it..."))
+
+        assertEquals(
+            listOf(
+                "rest-session-0",
+                "rest-session-1",
+                "uuid-stop",
+                "uuid-int",
+                "uuid-procs",
+                "rest-session-2",
+                "rest-session-3",
+            ),
+            merged.map { it.canonicalRestId ?: it.id },
+        )
+    }
+
     @Test
     fun commandEchoAndOutputStayInPlaceAcrossFutureSyncs() {
         val prompt = ChatMessage(id = "rest-session-0", role = MessageRole.USER, content = "what model are you?")
@@ -1011,4 +1209,59 @@ class ChatPagingMergeTest {
             chronological = !older,
             preserveLiveIds = true,
         )
+
+    @Test
+    fun restoredLocalCommandsKeepTheirChronologicalPlaceInCachedPage() {
+        fun row(
+            id: String,
+            role: MessageRole,
+            content: String,
+            ts: Long,
+            local: Long? = null,
+        ) = ChatMessage(id = id, role = role, content = content, timestamp = ts, localOrder = local)
+        // Room order: confirmed rows first, then every local row (sort_group 1).
+        val cachedPage =
+            listOf(
+                row("rest-s-1", MessageRole.USER, "hi", 10L),
+                row("rest-s-2", MessageRole.ASSISTANT, "hello", 11L),
+                row("rest-s-3", MessageRole.USER, "more", 30L),
+                row("rest-s-4", MessageRole.ASSISTANT, "ok", 31L),
+                row("rest-s-5", MessageRole.USER, "again", 50L),
+                row("rest-s-6", MessageRole.ASSISTANT, "sure", 51L),
+                row("cmd-a", MessageRole.USER, "/help", 12L, local = 1L),
+                row("cmd-b", MessageRole.USER, "/usage", 32L, local = 2L),
+                row("cmd-c", MessageRole.USER, "/model", 52L, local = 3L),
+            )
+
+        val merged = mergeCachedTranscriptPage(cachedPage, emptyList())
+
+        assertEquals(
+            listOf("rest-s-1", "rest-s-2", "cmd-a", "rest-s-3", "rest-s-4", "cmd-b", "rest-s-5", "rest-s-6", "cmd-c"),
+            merged.map { it.id },
+        )
+    }
+
+    @Test
+    fun restoredCommandOlderThanLoadedWindowStaysAboveItNotAtTheTail() {
+        val server =
+            listOf(
+                ChatMessage(id = "rest-s-50", role = MessageRole.USER, content = "a", timestamp = 500L),
+                ChatMessage(id = "rest-s-51", role = MessageRole.ASSISTANT, content = "b", timestamp = 501L),
+            )
+        val old =
+            ChatMessage(
+                id = "cmd",
+                role = MessageRole.USER,
+                content = "/model x",
+                timestamp = 100L,
+                localOrder = 9L,
+            )
+        val merged = mergeCachedTranscriptPage(server + old, emptyList())
+        assertEquals(listOf("cmd", "rest-s-50", "rest-s-51"), merged.map { it.id })
+        // Stable when an older page arrives afterwards.
+        val older = ChatMessage(id = "rest-s-10", role = MessageRole.USER, content = "o", timestamp = 50L)
+        val olderMid = ChatMessage(id = "rest-s-11", role = MessageRole.ASSISTANT, content = "p", timestamp = 150L)
+        val more = mergeCachedTranscriptPage(listOf(older, olderMid), merged)
+        assertEquals(listOf("rest-s-10", "cmd", "rest-s-11", "rest-s-50", "rest-s-51"), more.map { it.id })
+    }
 }

@@ -1,7 +1,11 @@
 package com.m57.hermescontrol.ui.chat.components
 
+import androidx.activity.ComponentActivity
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
@@ -12,21 +16,24 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeLeft
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
-import androidx.test.espresso.Espresso.pressBack
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.filters.MediumTest
+import androidx.test.platform.app.InstrumentationRegistry
+import com.m57.hermescontrol.R
+import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.ws.CommandCatalog
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -42,7 +49,7 @@ import org.junit.runner.RunWith
 @MediumTest
 class ComposerInteractionTest {
     @get:Rule
-    val composeTestRule = createComposeRule()
+    val composeTestRule = createAndroidComposeRule<ComponentActivity>()
 
     private var micTaps = 0
     private var sends = 0
@@ -53,6 +60,7 @@ class ComposerInteractionTest {
     private var fileTaps = 0
 
     /** Renders the real input bar with live text and a mic that toggles like ChatMediaLaunchers. */
+    @OptIn(ExperimentalFoundationApi::class)
     private fun setComposer(
         reasoningLevel: String? = "medium",
         model: String = "openai/gpt-5.5",
@@ -62,18 +70,17 @@ class ComposerInteractionTest {
         showModelProvider: Boolean = false,
     ) {
         composeTestRule.setContent {
-            var input by remember { mutableStateOf(TextFieldValue("")) }
+            val input = rememberTextFieldState()
             var listening by remember { mutableStateOf(false) }
             var currentModel by remember { mutableStateOf(model) }
 
             CompositionLocalProvider(LocalLayoutDirection provides layoutDirection) {
                 val composer: @Composable () -> Unit = {
                     ChatInputBar(
-                        inputFieldValue = input,
-                        onInputChange = { input = it },
+                        inputState = input,
                         onSend = {
                             sends++
-                            input = TextFieldValue("")
+                            input.clearText()
                         },
                         onMicTap = {
                             micTaps++
@@ -246,7 +253,8 @@ class ComposerInteractionTest {
             "short model pill should remain content-sized, width=$pillWidth toolbar=$toolbarWidth"
         }
         check(actionButton.right > toolbarBounds.right - 32.dp) {
-            "trailing action should stay near the toolbar edge, right=${actionButton.right} toolbarRight=${toolbarBounds.right}"
+            "trailing action should stay near the toolbar edge, " +
+                "right=${actionButton.right} toolbarRight=${toolbarBounds.right}"
         }
     }
 
@@ -337,11 +345,11 @@ class ComposerInteractionTest {
     }
 
     @Test
-    fun attachmentTray_dismissesOnBackPress() {
+    fun attachmentTray_dismissesOnActivityBack() {
         setComposer()
 
         openAttachmentTray()
-        pressBack()
+        composeTestRule.runOnUiThread { composeTestRule.activity.onBackPressedDispatcher.onBackPressed() }
         composeTestRule.mainClock.advanceTimeBy(300)
 
         composeTestRule.onNodeWithTag("attachment_tray").assertDoesNotExist()

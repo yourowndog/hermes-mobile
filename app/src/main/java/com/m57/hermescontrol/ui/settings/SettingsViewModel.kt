@@ -6,6 +6,7 @@ import com.m57.hermescontrol.data.config.ConnectionProfile
 import com.m57.hermescontrol.data.config.resolveBaseUrl
 import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.local.SessionListCacheStore
+import com.m57.hermescontrol.data.model.BusySendMode
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.remote.CleartextPolicy
 import com.m57.hermescontrol.data.remote.NetworkResult
@@ -37,14 +38,17 @@ data class SettingsUiState(
     val testResult: String? = null,
     val isSaved: Boolean = false,
     val typingEffectEnabled: Boolean = false,
+    val busySendMode: BusySendMode = BusySendMode.CORRECT,
     val typingEffectDelayMs: Int = 30,
     val chatFontScale: Float = 1.0f,
+    val chatFontFamily: String = "system",
     val messageStatsEnabled: Boolean = false,
     val showUserMessageTokens: Boolean = true,
     val showAssistantMessageTokens: Boolean = true,
     val showTokensPerSecond: Boolean = true,
     val showModelProvider: Boolean = false,
     val keepConnectedInBackground: Boolean = false,
+    val notifySessionCompletions: Boolean = false,
     val profiles: List<ConnectionProfile> = emptyList(),
     val selectedProfileId: String? = null,
     val renameProfileName: String = "",
@@ -85,14 +89,17 @@ class SettingsViewModel(
         val useDynamicColors = AuthManager.isUseDynamicColors()
         val themePreset = AuthManager.getThemePreset()
         val typingEffectEnabled = AuthManager.isTypingEffectEnabled()
+        val busySendMode = AuthManager.getBusySendMode()
         val typingEffectDelayMs = AuthManager.getTypingEffectDelayMs()
         val chatFontScale = AuthManager.getChatFontScale()
+        val chatFontFamily = AuthManager.getChatFontFamily()
         val messageStatsEnabled = AuthManager.isMessageStatsEnabled()
         val showUserMessageTokens = AuthManager.isUserMessageTokensEnabled()
         val showAssistantMessageTokens = AuthManager.isAssistantMessageTokensEnabled()
         val showTokensPerSecond = AuthManager.isTokensPerSecondEnabled()
         val showModelProvider = AuthManager.isModelProviderShown()
         val keepConnectedInBackground = AuthManager.isKeepConnectedInBackground()
+        val notifySessionCompletions = AuthManager.isNotifySessionCompletions()
         val profiles = AuthManager.getConnectionProfiles()
         val appLanguage = AuthManager.getAppLanguage()
         val renameProfileName =
@@ -112,14 +119,17 @@ class SettingsViewModel(
                 useDynamicColors = useDynamicColors,
                 themePreset = themePreset,
                 typingEffectEnabled = typingEffectEnabled,
+                busySendMode = busySendMode,
                 typingEffectDelayMs = typingEffectDelayMs,
                 chatFontScale = chatFontScale,
+                chatFontFamily = chatFontFamily,
                 messageStatsEnabled = messageStatsEnabled,
                 showUserMessageTokens = showUserMessageTokens,
                 showAssistantMessageTokens = showAssistantMessageTokens,
                 showTokensPerSecond = showTokensPerSecond,
                 showModelProvider = showModelProvider,
                 keepConnectedInBackground = keepConnectedInBackground,
+                notifySessionCompletions = notifySessionCompletions,
                 profiles = profiles,
                 selectedProfileId = selectedId,
                 renameProfileName = renameProfileName,
@@ -261,6 +271,15 @@ class SettingsViewModel(
         ApiClient.rebuild()
     }
 
+    fun onCustomHeadersSaved() {
+        val editedEndpoint = ServerEndpoint.parseForBuild(_uiState.value.dialogProfileBaseUrl)
+        if (editedEndpoint.baseUrl == AuthManager.endpointForBuild().baseUrl) {
+            ApiClient.rebuild()
+            HermesWsClient.disconnect()
+            HermesWsClient.connect()
+        }
+    }
+
     // ── Delete confirmation ──────────────────────────────────────────────
 
     fun requestDeleteProfile(profileId: String) {
@@ -336,6 +355,11 @@ class SettingsViewModel(
         AuthManager.setTypingEffectEnabled(enabled)
     }
 
+    fun onBusySendModeChange(mode: BusySendMode) {
+        _uiState.update { it.copy(busySendMode = mode, isSaved = false) }
+        AuthManager.setBusySendMode(mode)
+    }
+
     fun onTypingEffectDelayMsChange(delayMs: Int) {
         _uiState.update { it.copy(typingEffectDelayMs = delayMs, isSaved = false) }
         AuthManager.setTypingEffectDelayMs(delayMs)
@@ -344,6 +368,11 @@ class SettingsViewModel(
     fun onChatFontScaleChange(scale: Float) {
         _uiState.update { it.copy(chatFontScale = scale, isSaved = false) }
         AuthManager.setChatFontScale(scale)
+    }
+
+    fun onChatFontFamilyChange(fontFamily: String) {
+        _uiState.update { it.copy(chatFontFamily = fontFamily, isSaved = false) }
+        AuthManager.setChatFontFamily(fontFamily)
     }
 
     fun onMessageStatsEnabledChange(enabled: Boolean) {
@@ -374,6 +403,11 @@ class SettingsViewModel(
     fun onKeepConnectedInBackgroundChange(enabled: Boolean) {
         _uiState.update { it.copy(keepConnectedInBackground = enabled) }
         AuthManager.setKeepConnectedInBackground(enabled)
+    }
+
+    fun onNotifySessionCompletionsChange(enabled: Boolean) {
+        _uiState.update { it.copy(notifySessionCompletions = enabled) }
+        AuthManager.setNotifySessionCompletions(enabled)
     }
 
     /** Reconcile the chat shortcut with changes made through Settings or another screen. */

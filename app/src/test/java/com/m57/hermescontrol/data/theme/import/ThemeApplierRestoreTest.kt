@@ -1,0 +1,57 @@
+package com.m57.hermescontrol.data.theme.import
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Spec M6/M7: the persisted custom theme must fail *loudly enough for the UI*
+ * and silently enough for the process when it cannot be restored.
+ *
+ * [decodePersistedVariants] is the pure seam — it is what `restorePersisted`
+ * calls before touching `ThemeApplier`'s state or `AuthManager.serverStore`, so
+ * every unusable-input case is provable in a plain JVM test with no Android
+ * context, no network, and no `EncryptedSharedPreferences`.
+ */
+class ThemeApplierRestoreTest {
+    @Test
+    fun `blank payload is not restorable`() {
+        assertNull(decodePersistedVariants(null))
+        assertNull(decodePersistedVariants(""))
+        assertNull(decodePersistedVariants("   "))
+    }
+
+    @Test
+    fun `corrupt payload is not restorable`() {
+        assertNull(decodePersistedVariants("{not json"))
+        assertNull(decodePersistedVariants("[{\"colors\": "))
+        assertNull(decodePersistedVariants("\u0000\u0001"))
+    }
+
+    @Test
+    fun `empty variant list is not restorable`() {
+        // Valid JSON, decodes fine, but there is nothing to build a theme from.
+        assertNull(decodePersistedVariants("[]"))
+    }
+
+    @Test
+    fun `unknown keys are ignored rather than failing the restore`() {
+        val json =
+            """
+            [
+              {
+                "label": "Dark",
+                "colors": {"editor.background": "#101010"},
+                "somethingFromAFutureVersion": true
+              }
+            ]
+            """.trimIndent()
+        val variants = decodePersistedVariants(json)
+        assertNotNull(variants)
+        assertEquals(1, variants!!.size)
+        assertEquals("Dark", variants.first().label)
+        assertTrue(variants.first().colors.isNotEmpty())
+    }
+}

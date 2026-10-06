@@ -11,7 +11,10 @@ import android.speech.RecognizerIntent
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -19,44 +22,54 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.m57.hermescontrol.ExternalActivityLifecycleGuard
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.model.Attachment
-import com.m57.hermescontrol.ui.chat.ChatInputPolicy
 import com.m57.hermescontrol.ui.chat.SpeechInputHelper
+import com.m57.hermescontrol.ui.chat.VoiceNoteRecorder
+import kotlinx.coroutines.delay
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.sqrt
 
 class ChatMediaLaunchers(
     val isListening: Boolean,
+    val isRecordingVoice: Boolean,
+    val isVoiceNoteLocked: Boolean,
     val onMicTap: () -> Unit,
     val onCameraTap: () -> Unit,
     val onImageTap: () -> Unit,
     val onFileTap: () -> Unit,
+    val onMicHoldStart: () -> Unit = {},
+    val onMicHoldEnd: () -> Unit = {},
+    val onMicHoldCancel: () -> Unit = {},
+    val onMicLock: () -> Unit = {},
+    /** Normalized 0–1 mic level while recording; read fresh at draw time. */
+    val amplitudeProvider: () -> Float = { 0f },
 )
 
 @Composable
 fun rememberChatMediaLaunchers(
-    inputFieldValue: TextFieldValue,
-    onInputFieldValueChange: (TextFieldValue) -> Unit,
+    inputState: TextFieldState,
     onAddAttachment: (uri: String, name: String, mimeType: String, size: Long) -> Unit,
     onAddAttachments: (List<Attachment>) -> Unit,
+    onVoiceNoteRecorded: (file: File) -> Unit,
     onShowMessage: (String) -> Unit,
     launchExternalActivity: (() -> Unit) -> Unit,
+    isTranscribingVoiceNote: Boolean,
     context: Context = LocalContext.current,
 ): ChatMediaLaunchers {
     var isListening by remember { mutableStateOf(false) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
 
-    val currentInputFieldValue by rememberUpdatedState(inputFieldValue)
-    val currentOnInputFieldValueChange by rememberUpdatedState(onInputFieldValueChange)
+    val currentInputState by rememberUpdatedState(inputState)
     val currentOnAddAttachment by rememberUpdatedState(onAddAttachment)
     val currentOnAddAttachments by rememberUpdatedState(onAddAttachments)
+    val currentOnVoiceNoteRecorded by rememberUpdatedState(onVoiceNoteRecorded)
     val currentOnShowMessage by rememberUpdatedState(onShowMessage)
     val currentLaunchExternalActivity by rememberUpdatedState(launchExternalActivity)
 
@@ -64,6 +77,45 @@ fun rememberChatMediaLaunchers(
     val sttNotAvailableMsg = stringResource(R.string.stt_not_available)
     val sttPermissionDeniedMsg = stringResource(R.string.stt_permission_denied)
     val cameraErrorMsg = stringResource(R.string.chat_camera_error)
+    val voiceRecordFailedMsg = stringResource(R.string.chat_voice_record_failed)
+
+    // Hold-to-record voice note recorder: the clip uploads to the dashboard
+    // for server-side transcription, unlike the flat tap path below, which
+    // still drives the on-device recognizer.
+    val voiceNoteRecorder = remember { VoiceNoteRecorder(context) }
+    var isRecordingVoice by remember { mutableStateOf(false) }
+
+    // Locked = the recording continues after the finger lifts (slide up
+    // during the hold); the action button then submits it.
+    var isVoiceNoteLocked by remember { mutableStateOf(false) }
+
+    fun finishVoiceRecording() {
+        val recordedFile = voiceNoteRecorder.stop()
+        isRecordingVoice = false
+        isVoiceNoteLocked = false
+        if (recordedFile != null) {
+            currentOnVoiceNoteRecorded(recordedFile)
+        }
+    }
+
+    // App-owned max-duration cap: the timer drives the same
+    // finishVoiceRecording() path as the hold release, so exactly one code
+    // path ever calls stop() — MediaRecorder's own auto-stop used to race
+    // the release and discard a valid max-length clip (review, PR #1250).
+    LaunchedEffect(isRecordingVoice) {
+        if (isRecordingVoice) {
+            delay(VoiceNoteRecorder.MAX_DURATION_MS.toLong())
+            if (voiceNoteRecorder.isActive) {
+                finishVoiceRecording()
+            }
+        }
+    }
+
+    DisposableEffect(voiceNoteRecorder) {
+        onDispose {
+            voiceNoteRecorder.cancel()
+        }
+    }
 
     // Speech-to-text recognition launcher (issue #194)
     val speechLauncher =
@@ -79,14 +131,7 @@ fun rememberChatMediaLaunchers(
                         ?.firstOrNull()
                         .orEmpty()
                 if (spokenText.isNotBlank()) {
-                    val currentText = currentInputFieldValue.text
-                    val merged =
-                        if (currentText.isBlank()) {
-                            spokenText
-                        } else {
-                            "$currentText $spokenText"
-                        }
-                    currentOnInputFieldValueChange(ChatInputPolicy.commandFieldValue(merged))
+                    currentInputState.appendSpeechComposerDraft(spokenText)
                 }
             }
         }
@@ -113,6 +158,18 @@ fun rememberChatMediaLaunchers(
                     currentOnShowMessage(sttNotAvailableMsg)
                 }
             } else {
+                currentOnShowMessage(sttPermissionDeniedMsg)
+            }
+        }
+
+    // Hold-to-record permission: unlike the launcher above, granting does NOT
+    // auto-start dictation — the user records by holding the mic again.
+    val voiceNotePermissionLauncher =
+        rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestPermission(),
+        ) { granted ->
+            ExternalActivityLifecycleGuard.externalActivityReturned()
+            if (!granted) {
                 currentOnShowMessage(sttPermissionDeniedMsg)
             }
         }
@@ -183,7 +240,17 @@ fun rememberChatMediaLaunchers(
         }
 
     val onMicTap: () -> Unit = {
-        if (isListening) {
+        if (isTranscribingVoiceNote) {
+            // Single-flight: a server transcription owns the voice pipeline
+            // until it lands (review, PR #1250).
+        } else if (isVoiceNoteLocked) {
+            // The locked recording's action button submits the note.
+            finishVoiceRecording()
+        } else if (isRecordingVoice) {
+            // A tap while recording discards the in-flight voice note.
+            voiceNoteRecorder.cancel()
+            isRecordingVoice = false
+        } else if (isListening) {
             isListening = false
         } else if (
             ContextCompat.checkSelfPermission(
@@ -209,6 +276,71 @@ fun rememberChatMediaLaunchers(
             currentLaunchExternalActivity {
                 micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             }
+        }
+    }
+
+    val onMicHoldStart: () -> Unit = {
+        if (isTranscribingVoiceNote) {
+            // Single-flight: no new recording while a transcription runs.
+        } else if (voiceNoteRecorder.isActive || isListening) {
+            // A voice note or a dictation session is already running.
+        } else if (
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO,
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            if (voiceNoteRecorder.start()) {
+                isRecordingVoice = true
+            } else {
+                currentOnShowMessage(voiceRecordFailedMsg)
+            }
+        } else {
+            // The denial message comes from voiceNotePermissionLauncher's
+            // result callback only — showing it here fired it before the
+            // dialog even opened (review, PR #1250).
+            currentLaunchExternalActivity {
+                voiceNotePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+
+    val onMicHoldEnd: () -> Unit = {
+        if (voiceNoteRecorder.isActive) {
+            finishVoiceRecording()
+        }
+    }
+
+    val onMicHoldCancel: () -> Unit = {
+        if (voiceNoteRecorder.isActive) {
+            voiceNoteRecorder.cancel()
+        }
+        isRecordingVoice = false
+        isVoiceNoteLocked = false
+    }
+
+    // Locking keeps the recorder running once the finger lifts; only the
+    // panel's delete action or the action button can end it then.
+    val onMicLock: () -> Unit = {
+        if (voiceNoteRecorder.isActive) {
+            isVoiceNoteLocked = true
+        }
+    }
+
+    // Mic-level feed for the recording blob (VoiceMicBlob). MediaRecorder's
+    // maxAmplitude is the PEAK since the last read, so this poller must stay
+    // the ONLY caller while recording. sqrt compression spreads speech
+    // dynamics the way Telegram's RMS/1800 normalization does.
+    val recordingAmplitude = remember { mutableStateOf(0f) }
+    LaunchedEffect(isRecordingVoice) {
+        if (isRecordingVoice) {
+            while (isRecordingVoice) {
+                recordingAmplitude.value =
+                    sqrt(voiceNoteRecorder.currentAmplitude().coerceAtLeast(0) / 32767f)
+                delay(AMPLITUDE_POLL_MS)
+            }
+        } else {
+            recordingAmplitude.value = 0f
         }
     }
 
@@ -245,13 +377,23 @@ fun rememberChatMediaLaunchers(
         }
     }
 
-    return remember(isListening) {
+    return remember(isListening, isRecordingVoice, isVoiceNoteLocked, isTranscribingVoiceNote) {
         ChatMediaLaunchers(
-            isListening = isListening,
+            isListening = isListening || isRecordingVoice,
+            isRecordingVoice = isRecordingVoice,
+            isVoiceNoteLocked = isVoiceNoteLocked,
             onMicTap = onMicTap,
             onCameraTap = onCameraTap,
             onImageTap = onImageTap,
             onFileTap = onFileTap,
+            onMicHoldStart = onMicHoldStart,
+            onMicHoldEnd = onMicHoldEnd,
+            onMicHoldCancel = onMicHoldCancel,
+            onMicLock = onMicLock,
+            amplitudeProvider = { recordingAmplitude.value },
         )
     }
 }
+
+/** Telegram samples their amplitude pipeline roughly this fast. */
+private const val AMPLITUDE_POLL_MS = 60L

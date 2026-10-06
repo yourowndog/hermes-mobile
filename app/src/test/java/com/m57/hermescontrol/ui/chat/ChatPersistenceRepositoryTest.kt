@@ -4,12 +4,37 @@ import com.m57.hermescontrol.ui.chat.fakes.FakeChatMessageDao
 import kotlinx.coroutines.async
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Before
 import org.junit.Test
 
 class ChatPersistenceRepositoryTest {
     private lateinit var dao: FakeChatMessageDao
     private lateinit var repository: ChatPersistenceRepository
+
+    @Test
+    fun restoredModelCommandKeepsItsPositionAcrossRepeatedResume() =
+        runTest {
+            val earlier =
+                ChatMessage(id = "rest-s-10", role = MessageRole.ASSISTANT, content = "Earlier", timestamp = 900L)
+            val command =
+                ChatMessage(id = "model-command", role = MessageRole.USER, content = "/model test", timestamp = 1L)
+            val later = earlier.copy(id = "rest-s-11", content = "Later", timestamp = 100L)
+            repository.persistMessage(earlier, "s")
+            repository.persistMessage(command, "s")
+            repository.persistMessage(later, "s")
+
+            val freshRepository = ChatPersistenceRepository(dao)
+            val cached = freshRepository.loadPage("s", null, 150).messages
+            val restored = mergeCachedTranscriptPage(cached, emptyList())
+            val expected = listOf(earlier.id, command.id, later.id)
+            assertEquals(10L, cached.single { it.id == command.id }.localAnchorOrder)
+            assertEquals(expected, restored.map { it.id })
+            assertEquals(expected, mergeTranscriptWithLive(listOf(earlier, later), restored).map { it.id })
+            assertEquals(expected, mergeCachedTranscriptPage(cached, restored).map { it.id })
+            assertEquals(MessageProvenance.UNKNOWN, restored.single { it.id == command.id }.messageProvenance)
+            assertEquals(null, restored.single { it.id == command.id }.canonicalRestId)
+        }
 
     @Test
     fun providerIsLazyAndPendingWriteWaitsForDatabase() =
@@ -104,6 +129,23 @@ class ChatPersistenceRepositoryTest {
             assertEquals("USER", entity.role)
             assertEquals("Hello, world!", entity.content)
             assertEquals(1000L, entity.timestamp)
+        }
+
+    @Test
+    fun deleteMessageRemovesOnlyUnconfirmedOptimisticRows() =
+        runTest {
+            repository.persistMessage(ChatMessage(id = "local", role = MessageRole.USER, content = "draft"), "s")
+            repository.persistMessage(
+                ChatMessage(id = "confirmed", role = MessageRole.USER, content = "history", restId = "rest-s-7"),
+                "s",
+            )
+
+            repository.deleteMessage("local")
+            repository.deleteMessage("confirmed")
+
+            val rows = repository.loadMessages("s")
+            assertFalse(rows.any { it.id == "local" })
+            assertEquals("confirmed", rows.single().id)
         }
 
     @Test

@@ -81,6 +81,7 @@ data class SessionsUiState(
     val total: Int = 0,
     val hasMore: Boolean = false,
     val errorMessage: String? = null,
+    val corruptStorageProfiles: Set<String> = emptySet(),
     val stats: SessionStats = SessionStats(),
     val isLoadingStats: Boolean = false,
     val statsError: String? = null,
@@ -109,6 +110,9 @@ data class SessionsUiState(
     val searchNextOffset: Int? = null,
     val searchLoadMoreError: String? = null,
     val showHidden: Boolean = false,
+    // Archived view (issue #1496): lists only archived rows (backend archived=only).
+    val showArchived: Boolean = false,
+    val sourceFilter: String? = null,
     val pinnedExpanded: Boolean = true,
     val liveStatuses: Map<String, SessionLiveStatus> = emptyMap(),
     // Named projects used to label each row with the workspace it belongs to.
@@ -116,11 +120,34 @@ data class SessionsUiState(
 ) {
     val isSearchMode: Boolean get() = searchQuery.isNotBlank()
 
+    val archivedQuery: String? get() = if (showArchived) "only" else null
+
     val hasHiddenSessions: Boolean
         get() = sessions.any { it.hidden == true }
 
-    val displaySessions: List<SessionInfo>
+    // Source chips only exist for sources present in the rows currently loaded.
+    val availableSources: List<String>
+        get() {
+            val rows = if (isSearchMode) searchResults.map { it.source } else visibleBySource.map { it.source }
+            return rows
+                .mapNotNull { it?.lowercase()?.takeIf(String::isNotBlank) }
+                .groupingBy { it }
+                .eachCount()
+                .entries
+                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+                .map { it.key }
+        }
+
+    val activeSourceFilter: String?
+        get() = sourceFilter?.takeIf { it in availableSources }
+
+    private val visibleBySource: List<SessionInfo>
         get() = if (showHidden) sessions else sessions.filter { it.hidden != true }
+
+    val displaySessions: List<SessionInfo>
+        get() =
+            activeSourceFilter?.let { f -> visibleBySource.filter { it.source?.lowercase() == f } }
+                ?: visibleBySource
 
     val pinnedSessions: List<SessionInfo>
         get() = displaySessions.filter { it.pinned == true }
@@ -179,6 +206,7 @@ class SessionsViewModel(
                                 order = "recent",
                                 source = capturedSection.source,
                                 excludeSources = capturedSection.excludeSources,
+                                archived = _uiState.value.archivedQuery,
                             )
                         }
                 ) {
@@ -197,7 +225,8 @@ class SessionsViewModel(
                 val (requestScope, capturedSection) = scopeAndSection
                 val currentScope = runCatching { AuthManager.currentDataScope() }.getOrNull()
                 if (requestGeneration == generation && currentScope == requestScope) {
-                    val localKey = "${capturedSection.name}:${capturedSection.source}:${capturedSection.excludeSources}"
+                    if (handleStorageHealth(data)) return@refreshOnChange
+                    val localKey = listKey(capturedSection)
                     val inMemoryKey = requestScope?.inMemoryKey(localKey)
                     val persistentKey = requestScope?.persistentKey(localKey)
                     if (inMemoryKey != null) sessionsPageCache.put(inMemoryKey, data)
@@ -244,6 +273,7 @@ class SessionsViewModel(
                 selectedIds = emptySet(),
                 isSelecting = false,
                 errorMessage = null,
+                corruptStorageProfiles = emptySet(),
                 searchResults = emptyList(),
                 searchError = null,
                 searchLoadMoreError = null,
@@ -336,12 +366,14 @@ class SessionsViewModel(
         _uiState.update {
             it.copy(
                 section = section,
+                sourceFilter = null,
                 isLoading = false,
                 isLoadingMore = false,
                 sessions = emptyList(),
                 total = 0,
                 hasMore = false,
                 errorMessage = null,
+                corruptStorageProfiles = emptySet(),
                 isSelecting = false,
                 selectedIds = emptySet(),
                 isSearching = false,
@@ -352,18 +384,35 @@ class SessionsViewModel(
         if (query.isBlank()) loadSessions() else setSearchQuery(query)
     }
 
+    // #1286: a partial/empty damaged-store page is not an authoritative replacement.
+    private fun handleStorageHealth(data: SessionListResponse): Boolean {
+        val corruptProfiles = data.storage.filterValues { it == "corrupt" }.keys
+        _uiState.update { state ->
+            if (corruptProfiles.isEmpty()) {
+                state.copy(corruptStorageProfiles = emptySet())
+            } else {
+                state.copy(
+                    isLoading = false,
+                    isLoadingMore = false,
+                    errorMessage = null,
+                    corruptStorageProfiles = corruptProfiles,
+                    sessions = (state.sessions + data.sessions).distinctBy { it.id },
+                    hasMore = false,
+                )
+            }
+        }
+        return corruptProfiles.isNotEmpty()
+    }
+
     /** Load (or reload) sessions from page 0. Used by pull-to-refresh and initial load. */
     fun loadSessions(forceRefresh: Boolean = false) {
         val requestGeneration = generation
         val requestScope = runCatching { AuthManager.currentDataScope() }.getOrNull()
         val section = _uiState.value.section
-        val localKey = "${section.name}:${section.source}:${section.excludeSources}"
+        val localKey = listKey(section)
         val inMemoryKey = requestScope?.inMemoryKey(localKey)
         val persistentKey = requestScope?.persistentKey(localKey)
-        if (forceRefresh) {
-            if (inMemoryKey != null) sessionsPageCache.remove(inMemoryKey)
-            if (persistentKey != null) SessionListCacheStore.remove(persistentKey)
-        }
+        // #1286: keep the last good cache until a healthy refresh replaces it.
         val cached =
             if (!forceRefresh && inMemoryKey != null && persistentKey != null) {
                 sessionsPageCache.get(inMemoryKey)
@@ -407,6 +456,7 @@ class SessionsViewModel(
                             order = "recent",
                             source = section.source,
                             excludeSources = section.excludeSources,
+                            archived = _uiState.value.archivedQuery,
                         )
                     }
                 },
@@ -418,6 +468,7 @@ class SessionsViewModel(
                 onSuccess = { data ->
                     val currentScope = runCatching { AuthManager.currentDataScope() }.getOrNull()
                     if (requestGeneration != generation || currentScope != requestScope) return@safeLaunchLoad
+                    if (handleStorageHealth(data)) return@safeLaunchLoad
                     if (inMemoryKey != null) sessionsPageCache.put(inMemoryKey, data)
                     if (persistentKey != null) SessionListCacheStore.put(persistentKey, data)
                     rawPaginationOffset = data.nextOffset(0)
@@ -488,6 +539,7 @@ class SessionsViewModel(
                             order = "recent",
                             source = state.section.source,
                             excludeSources = state.section.excludeSources,
+                            archived = state.archivedQuery,
                         )
                     }
                 val currentScope = runCatching { AuthManager.currentDataScope() }.getOrNull()
@@ -495,6 +547,7 @@ class SessionsViewModel(
                 when (result) {
                     is NetworkResult.Success -> {
                         val data = result.data
+                        if (handleStorageHealth(data)) return@launch
                         rawPaginationOffset = data.nextOffset(offset)
                         _uiState.update {
                             val newSessions =
@@ -678,6 +731,10 @@ class SessionsViewModel(
 
     // ── Bulk selection ───────────────────────────────────────────────────
 
+    fun selectSourceFilter(source: String?) {
+        _uiState.update { it.copy(sourceFilter = if (it.sourceFilter == source) null else source) }
+    }
+
     fun toggleShowHidden() {
         _uiState.update { it.copy(showHidden = !it.showHidden) }
     }
@@ -825,46 +882,65 @@ class SessionsViewModel(
         }
     }
 
-    // ── Hide / unhide (issue #1019) ──────────────────────────────────────
+    // ── Archive / unarchive (issue #1496) ────────────────────────────────
 
     /**
-     * Toggle the hidden flag on a session via PATCH /api/sessions/{id} ({hidden}).
+     * Toggle the archived flag on a session via PATCH /api/sessions/{id} ({archived}).
+     * The list is filtered server-side by archived state, so on success the row leaves
+     * the current view (active list on archive, archived list on unarchive).
      */
-    fun toggleHide(sessionId: String) {
+    fun toggleArchive(sessionId: String) {
         val session = _uiState.value.sessions.find { it.id == sessionId } ?: return
-        val targetHidden = session.hidden != true
+        val targetArchived = session.archived != true
         viewModelScope.launch {
             val result =
                 safeApiCall {
-                    ApiClient.hermesApi.setSessionHidden(
+                    ApiClient.hermesApi.setSessionArchived(
                         sessionId = sessionId,
-                        body = SessionRenameRequest(hidden = targetHidden),
+                        body = SessionRenameRequest(archived = targetArchived),
                     )
                 }
             when (result) {
                 is NetworkResult.Success -> {
                     _uiState.update {
                         it.copy(
-                            sessions =
-                                it.sessions
-                                    .map { s -> if (s.id == sessionId) s.copy(hidden = targetHidden) else s },
+                            sessions = it.sessions.filterNot { s -> s.id == sessionId },
+                            total = (it.total - 1).coerceAtLeast(0),
                             toastMessage =
-                                if (targetHidden) {
-                                    "Session hidden"
+                                if (targetArchived) {
+                                    "Session archived"
                                 } else {
-                                    "Session unhidden"
+                                    "Session unarchived"
                                 },
                         )
                     }
+                    invalidateListCache()
                 }
 
                 is NetworkResult.Failure -> {
                     _uiState.update {
-                        it.copy(toastMessage = "Hide failed: ${result.error.message}")
+                        it.copy(toastMessage = "Archive failed: ${result.error.message}")
                     }
                 }
             }
         }
+    }
+
+    /** Switch between the active list and the archived-only list. */
+    fun toggleShowArchived() {
+        _uiState.update { it.copy(showArchived = !it.showArchived, sessions = emptyList(), selectedIds = emptySet()) }
+        loadSessions()
+    }
+
+    private fun listKey(section: HistorySection) =
+        "${section.name}:${section.source}:${section.excludeSources}:${_uiState.value.showArchived}"
+
+    private fun invalidateListCache() {
+        val section = _uiState.value.section
+        val localKey = listKey(section)
+        val scope = runCatching { AuthManager.currentDataScope() }.getOrNull() ?: return
+        sessionsPageCache.remove(scope.inMemoryKey(localKey))
+        SessionListCacheStore.remove(scope.persistentKey(localKey))
     }
 
     // ── Delete (single) ──────────────────────────────────────────────────
@@ -940,7 +1016,13 @@ class SessionsViewModel(
             val result =
                 safeApiCall {
                     ApiClient.hermesApi.bulkDeleteSessions(
-                        body = BulkDeleteRequest(ids = ids),
+                        body =
+                            BulkDeleteRequest(
+                                ids = ids,
+                                // Destructive POSTs scope by BODY profile; the
+                                // ?profile= query rewrite never reaches them.
+                                profile = AuthManager.activeProfileId.value,
+                            ),
                     )
                 }
             when (result) {
@@ -998,7 +1080,16 @@ class SessionsViewModel(
             val result =
                 safeApiCall {
                     ApiClient.hermesApi.pruneSessions(
-                        body = PruneRequest(days = days),
+                        body =
+                            PruneRequest(
+                                // The server model is `older_than_days`; the
+                                // old `days` key was silently ignored and the
+                                // backend pruned its own 90-day default.
+                                olderThanDays = days,
+                                // Destructive POSTs scope by BODY profile; the
+                                // ?profile= query rewrite never reaches them.
+                                profile = AuthManager.activeProfileId.value,
+                            ),
                     )
                 }
             when (result) {
@@ -1122,6 +1213,7 @@ class SessionsViewModel(
                     liveStatusSource.events.collect { event ->
                         liveTrackingState = SessionLiveStatusReducer.applyWsEvent(liveTrackingState, event)
                         _uiState.update { it.copy(liveStatuses = liveTrackingState.liveStatuses) }
+                        if (event is WsEvent.SessionTitle) applySessionTitle(event)
                     }
                 }
 
@@ -1142,6 +1234,30 @@ class SessionsViewModel(
                     }
                 }
             }
+    }
+
+    /**
+     * Issue #1463: apply an auto-title push to the loaded rows in place (no spinner, selection or paging reset) and
+     * drop only the current scope+section cache entries so a cache-first reopen can't resurrect the old title.
+     */
+    private fun applySessionTitle(event: WsEvent.SessionTitle) {
+        _uiState.update { state ->
+            if (state.sessions.none { it.id == event.storedSessionId }) {
+                state
+            } else {
+                state.copy(
+                    sessions =
+                        state.sessions.map {
+                            if (it.id == event.storedSessionId) it.copy(title = event.title) else it
+                        },
+                )
+            }
+        }
+        val section = _uiState.value.section
+        val localKey = listKey(section)
+        val scope = runCatching { AuthManager.currentDataScope() }.getOrNull() ?: return
+        sessionsPageCache.remove(scope.inMemoryKey(localKey))
+        SessionListCacheStore.remove(scope.persistentKey(localKey))
     }
 
     fun stopLiveStatusTracking() {

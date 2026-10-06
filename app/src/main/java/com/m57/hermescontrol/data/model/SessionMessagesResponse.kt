@@ -1,7 +1,9 @@
 package com.m57.hermescontrol.data.model
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
@@ -59,9 +61,24 @@ data class SessionMessage(
     val display_metadata: JsonElement? = null,
     /** Token count recorded by the backend. */
     val token_count: JsonElement? = null,
+    /**
+     * Public interim commentary projected by the backend for assistant rows
+     * (agent/history_commentary.py, issue #1284). Rendered as assistant text
+     * ahead of the reply. Absent on older gateways.
+     */
+    val display_commentary: JsonElement? = null,
+    /**
+     * [reasoning] with the flattened commentary removed. When present (even
+     * empty) it wins over the raw reasoning so commentary is not shown twice.
+     */
+    val display_reasoning: JsonElement? = null,
 ) {
     val timestampText: String?
         get() = (timestamp as? JsonPrimitive)?.content
+
+    /** Emoji reactions persisted on this row (`display_metadata.reactions`). */
+    val reactions: List<MessageReaction>
+        get() = parseMessageReactions(display_metadata)
 
     val tokenCount: Int?
         get() {
@@ -84,20 +101,10 @@ data class SessionMessage(
         }
 
     val contentText: String
-        get() =
-            when (content) {
-                is JsonPrimitive -> content.content
-                null -> ""
-                else -> content.toString()
-            }
+        get() = content?.transcriptText().orEmpty()
 
     val displayContentText: String?
-        get() =
-            when (display_content) {
-                is JsonPrimitive -> display_content.content
-                null -> null
-                else -> display_content.toString()
-            }
+        get() = display_content?.transcriptText()
 
     val reasoningText: String
         get() =
@@ -107,6 +114,62 @@ data class SessionMessage(
                 else -> r.toString()
             }
 
+    /** True when the backend projected reasoning; it is then authoritative, even if empty. */
+    val hasDisplayReasoning: Boolean
+        get() = (display_reasoning as? JsonPrimitive)?.isString == true
+
+    /** [display_reasoning] when projected, else raw reasoning (older gateways). */
+    val displayReasoningText: String
+        get() = (display_reasoning as? JsonPrimitive)?.takeIf { it.isString }?.content ?: reasoningText
+
+    /** Nonblank public commentary items, in order. */
+    val displayCommentary: List<String>
+        get() =
+            (display_commentary as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content?.trim() }
+                ?.filter { it.isNotEmpty() }
+                .orEmpty()
+
+    /**
+     * Visible assistant text: interim commentary, then the reply. Commentary that
+     * merely repeats the reply (some providers persist it as content) renders once.
+     */
+    val visibleText: String
+        get() {
+            val reply = displayContentText ?: contentText
+            val commentary = displayCommentary
+            if (commentary.isEmpty()) return reply
+            val joined = commentary.joinToString("\n\n")
+            if (reply.isBlank()) return joined
+
+            fun normalized(value: String) = value.replace(WHITESPACE, " ").trim()
+            if (normalized(joined) == normalized(reply)) return reply
+            return "$joined\n\n$reply"
+        }
+
     val toolCallId: String
         get() = tool_call_id.orEmpty()
 }
+
+// #1432: model-facing multipart payloads contain inline image bytes, not displayable JSON.
+private fun JsonElement.transcriptText(): String =
+    when (this) {
+        is JsonPrimitive -> {
+            content
+        }
+
+        is JsonArray -> {
+            mapNotNull { part ->
+                val block = part as? JsonObject ?: return@mapNotNull null
+                val type = block["type"]
+                if (type != null && (type as? JsonPrimitive)?.content != "text") return@mapNotNull null
+                (block["text"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+            }.joinToString("\n")
+        }
+
+        else -> {
+            toString()
+        }
+    }
+
+private val WHITESPACE = Regex("\\s+")

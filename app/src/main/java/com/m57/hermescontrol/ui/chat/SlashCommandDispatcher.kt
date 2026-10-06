@@ -10,7 +10,8 @@ package com.m57.hermescontrol.ui.chat
  * `/fork` and `/model` are NOT sent via [SlashResult.RpcDispatch] (which maps
  * to the `command.dispatch` RPC — that RPC only knows quick/plugin/bundle/skill
  * commands and 4018s on everything else). They are real backend commands that
- * get their own results: `/fork` goes via the `session.branch` RPC and `/model`
+ * get their own results: `/fork` goes via the `session.branch_whole` RPC (with
+ * fallback to `session.branch` on older gateways) and `/model`
  * via the `config.set` RPC (key="model" → gateway `_apply_model_switch`; the
  * TUI gateway's `prompt.submit` does NOT parse slash commands, so sending it as
  * a normal prompt makes the LLM treat it as text). `/update` is intercepted
@@ -26,7 +27,11 @@ class SlashCommandDispatcher {
         val cmd = parts[0].lowercase()
 
         return when (cmd) {
-            "/stop", "/interrupt" -> {
+            "/stop" -> {
+                SlashResult.Stop
+            }
+
+            "/interrupt" -> {
                 SlashResult.Interrupt
             }
 
@@ -76,6 +81,11 @@ class SlashCommandDispatcher {
                 SlashResult.Undo(count = arg)
             }
 
+            "/compress", "/compact" -> {
+                val arg = command.split(" ", limit = 2).getOrElse(1) { "" }.trim()
+                SlashResult.Compress(focusTopic = arg)
+            }
+
             else -> {
                 SlashResult.RpcDispatch
             }
@@ -90,10 +100,13 @@ sealed class SlashResult {
     /** Interrupt the active session (client-side immediate). */
     data object Interrupt : SlashResult()
 
+    /** Desktop `/stop`: interrupt the active turn, then kill background processes (`process.stop`). */
+    data object Stop : SlashResult()
+
     /** Create a new session (client-side immediate). */
     data object NewSession : SlashResult()
 
-    /** Forward to command.dispatch via WebSocket. */
+    /** Execute through slash.exec, with command.dispatch as the desktop-compatible fallback. */
     data object RpcDispatch : SlashResult()
 
     /** Fork the active conversation via the session.branch WebSocket RPC. */
@@ -170,5 +183,12 @@ sealed class SlashResult {
      */
     data class Undo(
         val count: String,
+    ) : SlashResult()
+
+    /**
+     * Compress session context via the session.compress WebSocket RPC.
+     */
+    data class Compress(
+        val focusTopic: String,
     ) : SlashResult()
 }

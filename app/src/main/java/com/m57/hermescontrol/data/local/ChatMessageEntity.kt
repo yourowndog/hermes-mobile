@@ -54,6 +54,12 @@ data class ChatMessageEntity(
     val sortGroup: Int = 1,
     @ColumnInfo(name = "sort_order", defaultValue = "0")
     val sortOrder: Long = 0,
+    @ColumnInfo(name = "message_provenance", defaultValue = "'UNKNOWN'")
+    val messageProvenance: String = "UNKNOWN",
+    @ColumnInfo(name = "local_anchor_order")
+    val localAnchorOrder: Long? = null,
+    @ColumnInfo(name = "local_predecessor_id")
+    val localPredecessorId: String? = null,
 )
 
 internal fun ChatMessageEntity.isSessionStartMarker(): Boolean =
@@ -64,7 +70,9 @@ internal fun canonicalMessageOrder(
     id: String,
     sessionId: String,
 ): Long? {
-    val prefix = "rest-$sessionId-"
+    val prefix =
+        com.m57.hermescontrol.ui.chat.RestMessageId
+            .sessionPrefix(sessionId)
     if (!id.startsWith(prefix)) return null
     val suffix = id.removePrefix(prefix)
     return suffix.takeIf { it.isNotEmpty() && it.all { char -> char in '0'..'9' } }?.toLongOrNull()

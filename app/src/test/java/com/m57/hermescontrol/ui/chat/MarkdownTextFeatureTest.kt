@@ -459,6 +459,28 @@ class MarkdownTextFeatureTest {
         assertEquals(0, o16.level)
     }
 
+    @Test
+    fun quotedBlocksRetainNestedHeadingsListsAndFences() {
+        val source = "> # Heading\n> - item\n>   ```kotlin\n>   val x = 1\n>   ```"
+        val quote = parseBlocks(source).single() as MdBlock.Quote
+        val nested = parseBlocks(quote.text)
+        assertTrue(nested.any { it is MdBlock.Heading && it.text == "Heading" })
+        val bullet = nested.filterIsInstance<MdBlock.Bullet>().single()
+        assertEquals("item", bullet.text)
+        assertEquals("val x = 1", (parseBlocks(bullet.nestedSource).single() as MdBlock.Code).code)
+    }
+
+    @Test
+    fun listItemsRetainFencedCodeAndHeadingsAsNestedBlocks() {
+        val source = "- intro\n  ```kotlin\n  val x = 1\n  ```\n  # Inside\n- next"
+        val bullets = parseBlocks(source).filterIsInstance<MdBlock.Bullet>()
+        assertEquals(listOf("intro", "next"), bullets.map { it.text })
+        val nested = parseBlocks(bullets.first().nestedSource)
+        assertTrue(nested.any { it is MdBlock.Code && it.code == "val x = 1" })
+        assertTrue(nested.any { it is MdBlock.Heading && it.text == "Inside" })
+        assertEquals("", bullets.last().nestedSource)
+    }
+
     // 19. NESTED CODEBLOCKS & EXTENDED CODE FENCES
     @Test
     fun testNestedCodeBlock_fourBackticksWrappingThreeBackticks() {
@@ -566,6 +588,64 @@ class MarkdownTextFeatureTest {
         val input = "Run `val x = 1` here"
         val parsed = parseInline(input, Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
         assertEquals("Run val x = 1 here", parsed.toString())
+    }
+
+    @Test
+    fun testNestedInlineStyles_preserveCodeAndEmphasisFormatting() {
+        val parsed = parseInline("**bold `code` and *italic***", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("bold code and italic", parsed.toString())
+        assertTrue(parsed.spanStyles.any { it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold })
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+        assertTrue(parsed.spanStyles.any { it.item.fontStyle == androidx.compose.ui.text.font.FontStyle.Italic })
+        val codeStart = parsed.indexOf("code")
+        assertTrue(
+            parsed.spanStyles.any {
+                it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold &&
+                    it.start <= codeStart &&
+                    it.end >= codeStart + 4
+            },
+        )
+        assertTrue(
+            parsed.spanStyles.any {
+                it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace &&
+                    it.start <= codeStart &&
+                    it.end >= codeStart + 4
+            },
+        )
+    }
+
+    @Test
+    fun testLinkLabel_nestedEmphasisAndCode() {
+        val parsed =
+            parseInline(
+                "[**bold `code`**](https://example.com)",
+                Color.Black,
+                "",
+                false,
+                Color.Blue,
+                DEFAULT_HIGHLIGHTS,
+            )
+
+        assertEquals("bold code", parsed.toString())
+        assertTrue(parsed.getLinkAnnotations(0, parsed.length).isNotEmpty())
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
+    }
+
+    @Test
+    fun testCodeSpan_doesNotParseInnerEmphasis() {
+        val parsed = parseInline("`**literal**`", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("**literal**", parsed.toString())
+        assertFalse(parsed.spanStyles.any { it.item.fontWeight == androidx.compose.ui.text.font.FontWeight.Bold })
+    }
+
+    @Test
+    fun testInlineCode_matchesSameLengthBacktickRunAndPreservesUnmatchedRun() {
+        val parsed = parseInline("``a ` tick`` and `unfinished", Color.Black, "", false, Color.Blue, DEFAULT_HIGHLIGHTS)
+
+        assertEquals("a ` tick and `unfinished", parsed.toString())
+        assertTrue(parsed.spanStyles.any { it.item.fontFamily == androidx.compose.ui.text.font.FontFamily.Monospace })
     }
 
     @Test

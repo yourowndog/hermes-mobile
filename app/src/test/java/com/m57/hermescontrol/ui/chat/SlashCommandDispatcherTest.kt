@@ -20,8 +20,8 @@ class SlashCommandDispatcherTest {
     private val dispatcher = SlashCommandDispatcher()
 
     @Test
-    fun `stop routes to Interrupt`() {
-        assertEquals(SlashResult.Interrupt, dispatcher.dispatch("/stop"))
+    fun `stop routes to Stop`() {
+        assertEquals(SlashResult.Stop, dispatcher.dispatch("/stop"))
     }
 
     @Test
@@ -96,6 +96,15 @@ class SlashCommandDispatcherTest {
         assertEquals(SlashResult.Undo("2"), dispatcher.dispatch("/undo 2"))
         assertEquals(SlashResult.Undo("3"), dispatcher.dispatch("/UNDO 3"))
         assertEquals(SlashResult.Undo(""), dispatcher.dispatch("/Undo"))
+    }
+
+    @Test
+    fun `compress and compact route to Compress`() {
+        assertEquals(SlashResult.Compress(""), dispatcher.dispatch("/compress"))
+        assertEquals(SlashResult.Compress(""), dispatcher.dispatch("/compact"))
+        assertEquals(SlashResult.Compress("auth decisions"), dispatcher.dispatch("/compress auth decisions"))
+        assertEquals(SlashResult.Compress("auth decisions"), dispatcher.dispatch("/compact auth decisions"))
+        assertEquals(SlashResult.Compress(""), dispatcher.dispatch("/compress   "))
     }
 
     @Test

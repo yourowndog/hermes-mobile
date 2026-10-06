@@ -69,6 +69,40 @@ private fun stripSealedOrphanPrefix(
  * Android or ViewModel classes. Easy to unit test.
  */
 object ChatWsEventReducer {
+    /**
+     * Projects retained terminal state without consulting any live streaming buffers.
+     * Only `inflight.assistant` may become assistant prose; stale UI text, reasoning,
+     * and message ids are deliberately excluded.
+     */
+    fun reduceRetainedReplyFailure(
+        state: ChatUiState,
+        inflight: Map<String, Any?>,
+        currentSessionId: String,
+    ): ReducerResult {
+        if (inflight["status"] != "error") return ReducerResult(state, StreamingState())
+        val assistant = (inflight["assistant"] as? String).orEmpty()
+        val payload = inflight.toMutableMap().apply { put("partial", assistant.isNotBlank()) }
+        val cleanState =
+            state.copy(
+                isAgentTyping = false,
+                isThinking = false,
+                thinkingText = "",
+                streamingMessage = null,
+            )
+        return reduce(
+            cleanState,
+            StreamingState(),
+            WsEvent.MessageComplete(
+                text = assistant,
+                sessionId = currentSessionId,
+                // Retained inflight has no completion identity; suppress the event's random default.
+                completionId = "",
+                rawPayload = payload,
+            ),
+            currentSessionId,
+        )
+    }
+
     fun reduce(
         state: ChatUiState,
         streamingState: StreamingState,
@@ -95,12 +129,14 @@ object ChatWsEventReducer {
                 is WsEvent.BtwComplete -> event.sessionId
                 is WsEvent.SessionUsage -> event.sessionId
                 is WsEvent.TranscriptResyncRequired -> event.sessionId
+                is WsEvent.MessageReactionUpdated -> event.sessionId
                 is WsEvent.VaultUnlockRequest -> event.sessionId
                 is WsEvent.VaultUnlockExpire -> event.sessionId
                 is WsEvent.VaultSaveLoginRequest -> event.sessionId
                 is WsEvent.VaultSaveLoginExpire -> event.sessionId
                 is WsEvent.VaultCodeRequest -> event.sessionId
                 is WsEvent.VaultCodeExpire -> event.sessionId
+                is WsEvent.StatusUpdate -> event.sessionId
                 else -> null
             }
         if (eventSessionId != null && (currentSessionId == null || eventSessionId != currentSessionId)) {
@@ -174,7 +210,12 @@ object ChatWsEventReducer {
 
             is WsEvent.SessionUpdated -> onSessionUpdated(state, streamingState)
 
-            is WsEvent.StatusUpdate -> onStatusUpdate(state, streamingState)
+            is WsEvent.SessionTitle -> onSessionTitle(state, streamingState, event)
+
+            // Runtime invalidation needs ViewModel context (runtime binding, queue, resume path).
+            is WsEvent.SessionReclaimed -> ReducerResult(state = state, streamingState = streamingState)
+
+            is WsEvent.StatusUpdate -> onStatusUpdate(state, streamingState, event)
 
             is WsEvent.ConnectionRequest,
             is WsEvent.ConnectionUpdate,
@@ -218,6 +259,8 @@ object ChatWsEventReducer {
             // ReactionEvent is handled by the ViewModel — purely cosmetic animation
             is WsEvent.ReactionEvent -> ReducerResult(state = state, streamingState = streamingState)
 
+            is WsEvent.MessageReactionUpdated -> onMessageReaction(state, streamingState, event)
+
             // Change events (issue #784) are consumed by their screens' ViewModels
             is WsEvent.ChangeEvent -> ReducerResult(state = state, streamingState = streamingState)
 
@@ -239,6 +282,18 @@ object ChatWsEventReducer {
         streamingState: StreamingState,
         event: WsEvent.MessageStart,
     ): ReducerResult {
+        val previousFailureMessageId = state.replyFailureProjection?.messageId
+        val turnState =
+            state.copy(
+                messages =
+                    if (previousFailureMessageId == null) {
+                        state.messages
+                    } else {
+                        state.messages.filterNot { it.id == previousFailureMessageId }
+                    },
+                replyFailure = null,
+                replyFailureProjection = null,
+            )
         val msg =
             ChatMessage(
                 role = MessageRole.ASSISTANT,
@@ -252,10 +307,10 @@ object ChatWsEventReducer {
         val effects = mutableListOf<ReducerEffect>()
 
         val cleanedSubagents =
-            if (state.subagentIndicators.all { it.isComplete || it.isFailed }) {
+            if (turnState.subagentIndicators.all { it.isComplete || it.isFailed }) {
                 emptyList()
             } else {
-                state.subagentIndicators
+                turnState.subagentIndicators
             }
 
         // Build new state: finalize any orphan streaming message, then set the new one
@@ -270,13 +325,13 @@ object ChatWsEventReducer {
                         tps = null,
                     )
                 orphan = finalized
-                state.copy(
-                    messages = state.messages.upsertById(finalized),
+                turnState.copy(
+                    messages = turnState.messages.upsertById(finalized),
                     isAgentTyping = true,
                     subagentIndicators = cleanedSubagents,
                 )
             } else {
-                state.copy(
+                turnState.copy(
                     isAgentTyping = true,
                     subagentIndicators = cleanedSubagents,
                 )
@@ -406,10 +461,13 @@ object ChatWsEventReducer {
         streamingState: StreamingState,
         event: WsEvent.MessageComplete,
     ): ReducerResult {
+        val failure = replyFailureFromPayload(event.rawPayload, event.text)
+        if (failure != null) return onReplyFailure(state, streamingState, event, failure)
+        if (GatewayNotice.isInterruptSentinel(event.text)) return onInterruptNotice(state, streamingState, event)
         val finalSnapshot = event.rawPayload?.let(::parseUsageSnapshot)
         val usageState = finalSnapshot?.let { applyUsageSnapshot(state, it) } ?: state
         val turnUsage = finalSnapshot?.deltaFrom(streamingState.turnUsageBaseline)
-        val streaming = streamingState.streamingMessage
+        val streaming = streamingState.interruptedMessage ?: streamingState.streamingMessage
         // Prefer the authoritative reasoning carried in the message.complete
         // payload (the gateway's assembled full trace), then fall back to
         // whatever reasoning.delta deltas accumulated during streaming.
@@ -467,6 +525,9 @@ object ChatWsEventReducer {
                 effects = effects,
             )
         }
+        // #1285: bind the committed final row only when this bubble carries the whole reply body;
+        // a stripped commentary prefix means the local bubble is not that row's exact content.
+        val finalRowId = parsePersistedTurn(event.rawPayload)?.finalAssistantRowId?.takeIf { text == event.text }
         val tps = turnUsage?.avgTps.validTpsOrNull() ?: usageState.latestTps.validTpsOrNull()
         val tokenCount =
             if (turnUsage?.outputTokens != null) {
@@ -483,6 +544,7 @@ object ChatWsEventReducer {
                 tokenCount = tokenCount,
                 tps = tps,
                 completionId = event.completionId,
+                serverRowId = finalRowId ?: streaming.serverRowId,
             ) ?: ChatMessage(
                 role = MessageRole.ASSISTANT,
                 content = text,
@@ -491,6 +553,7 @@ object ChatWsEventReducer {
                 tokenCount = tokenCount,
                 tps = tps,
                 completionId = event.completionId,
+                serverRowId = finalRowId,
             )
         val effects = mutableListOf<ReducerEffect>()
         val sid = state.currentSessionId
@@ -520,6 +583,86 @@ object ChatWsEventReducer {
         )
     }
 
+    // Keep terminal diagnostics out of normal assistant messages and persistence.
+    private fun onReplyFailure(
+        state: ChatUiState,
+        streamingState: StreamingState,
+        event: WsEvent.MessageComplete,
+        failure: ReplyFailure,
+    ): ReducerResult {
+        val usageState = event.rawPayload?.let(::parseUsageSnapshot)?.let { applyUsageSnapshot(state, it) } ?: state
+        val streaming = streamingState.streamingMessage
+        val text =
+            if (event.rawPayload?.get("partial") == true) {
+                event.text
+                    .takeIf { it.isNotBlank() }
+                    ?.let { stripSealedOrphanPrefix(it, state.messages, streamingState.sealedOrphanIds) }
+                    ?: streaming?.content.orEmpty()
+            } else {
+                streaming?.content.orEmpty()
+            }
+        val reasoning = streamingState.reasoningText.ifBlank { streaming?.reasoningText.orEmpty() }
+        val existingProjection = state.replyFailureProjection
+        val completionId = event.completionId?.takeIf { it.isNotBlank() } ?: existingProjection?.completionId
+        val sessionIdentity = state.currentSessionId ?: event.sessionId.orEmpty()
+        val failureId =
+            existingProjection?.failureId
+                ?: event.completionId?.takeIf { it.isNotBlank() }?.let { "reply-failure-$sessionIdentity-$it" }
+                ?: failure.id
+        val projectionMessageId =
+            existingProjection?.messageId
+                ?: streaming?.id
+                ?: event.completionId?.takeIf { it.isNotBlank() }?.let { "reply-failure-message-$it" }
+                ?: if (text.isNotBlank() || reasoning.isNotBlank()) "reply-failure-message-$failureId" else null
+        val projection = ReplyFailureProjection(projectionMessageId, failureId, completionId)
+        val existingProjectedMessage =
+            projectionMessageId?.let { id -> usageState.messages.firstOrNull { it.id == id } }
+        val partial =
+            if (text.isNotBlank() || reasoning.isNotBlank()) {
+                val base =
+                    streaming
+                        ?: existingProjectedMessage
+                        ?: ChatMessage(
+                            id = checkNotNull(projectionMessageId),
+                            role = MessageRole.ASSISTANT,
+                            content = "",
+                        )
+                base.copy(
+                    id = checkNotNull(projectionMessageId),
+                    content = text,
+                    reasoningText = reasoning,
+                    isStreaming = false,
+                    finishTimestamp = System.currentTimeMillis(),
+                    completionId = completionId,
+                )
+            } else {
+                null
+            }
+        val messagesWithoutOldProjection =
+            existingProjection?.messageId?.let { oldId -> usageState.messages.filterNot { it.id == oldId } }
+                ?: usageState.messages
+        val projectedMessages =
+            partial?.let { messagesWithoutOldProjection.upsertById(it) } ?: messagesWithoutOldProjection
+        // A failed partial is a transient projection of gateway `inflight`, not a
+        // successful transcript row. Persisting it would erase failure provenance on
+        // hydration and make a later session reopen look healthy.
+        val effects = listOf(ReducerEffect.RefreshSessions, ReducerEffect.RefreshContextUsage)
+        return ReducerResult(
+            state =
+                usageState.copy(
+                    messages = projectedMessages,
+                    replyFailure = failure.copy(id = failureId),
+                    replyFailureProjection = projection,
+                    isAgentTyping = false,
+                    isThinking = false,
+                    streamingMessage = null,
+                    clarifyRequest = null,
+                ),
+            streamingState = StreamingState(),
+            effects = effects,
+        )
+    }
+
     // ── MessageDone ───────────────────────────────────────────────────
 
     private fun onMessageDone(
@@ -530,7 +673,7 @@ object ChatWsEventReducer {
             streamingState.streamingMessage
                 ?: return ReducerResult(
                     state = state.copy(isAgentTyping = false),
-                    streamingState = StreamingState(),
+                    streamingState = streamingState.takeIf { it.interruptedMessage != null } ?: StreamingState(),
                 )
         val reasoning =
             if (streamingState.reasoningText.isNotBlank()) {
@@ -681,6 +824,7 @@ object ChatWsEventReducer {
             messages[toolIdx].copy(
                 toolStatus = ToolStatus.COMPLETED,
                 content = contentJson,
+                isHistoricalCache = false,
             )
         messages[toolIdx] = updated
 
@@ -909,10 +1053,150 @@ object ChatWsEventReducer {
         streamingState: StreamingState,
     ): ReducerResult = ReducerResult(state = state, streamingState = streamingState)
 
+    /** Issue #1463: payload id is the STORED key, so match it against the stored `currentSessionId`. */
+    private fun onSessionTitle(
+        state: ChatUiState,
+        streamingState: StreamingState,
+        event: WsEvent.SessionTitle,
+    ): ReducerResult {
+        val isCurrent = state.currentSessionId == event.storedSessionId
+        val rowKnown = state.sessions.any { it.id == event.storedSessionId }
+        if (!isCurrent && !rowKnown) return ReducerResult(state = state, streamingState = streamingState)
+        return ReducerResult(
+            state =
+                state.copy(
+                    chatTitle = if (isCurrent) event.title else state.chatTitle,
+                    sessions =
+                        state.sessions.map {
+                            if (it.id == event.storedSessionId) it.copy(title = event.title) else it
+                        },
+                ),
+            streamingState = streamingState,
+        )
+    }
+
     private fun onStatusUpdate(
         state: ChatUiState,
         streamingState: StreamingState,
-    ): ReducerResult = ReducerResult(state = state, streamingState = streamingState)
+        event: WsEvent.StatusUpdate,
+    ): ReducerResult {
+        val kind = event.data?.get("kind") as? String
+        val text = (event.data?.get("text") as? String)?.trim()
+        return when (kind) {
+            // In-progress compaction is live state: the tail indicator shows only while it runs.
+            "compressing", "compacting" -> {
+                ReducerResult(
+                    state =
+                        state.copy(
+                            isCompressing = true,
+                            compressionStatus = text?.ifBlank { null } ?: "⏳ Compressing context...",
+                        ),
+                    streamingState = streamingState,
+                )
+            }
+
+            // #1433: the done edge is a transcript event, seated where it happened, never a floating tail row.
+            "compacted" -> {
+                appendGatewayNotice(state.copy(isCompressing = false, compressionStatus = null), streamingState, text)
+            }
+
+            "ready" -> {
+                ReducerResult(
+                    state = state.copy(isCompressing = false, compressionStatus = null),
+                    streamingState = streamingState,
+                )
+            }
+
+            // Durable notices the desktop/TUI also paint into the transcript.
+            "goal", "loop", "warn", "fallback" -> {
+                appendGatewayNotice(state, streamingState, text)
+            }
+
+            else -> {
+                ReducerResult(state = state, streamingState = streamingState)
+            }
+        }
+    }
+
+    /**
+     * Appends a gateway notice as a persisted SYSTEM row (#1433). SYSTEM rows are permanently local, so
+     * `inTranscriptOrder` anchors them after their preceding confirmed row instead of the transcript tail.
+     * A replayed event (reconnect `session.events.since`) re-sends the same text within the current turn;
+     * skip it rather than stacking a duplicate.
+     */
+    private fun appendGatewayNotice(
+        state: ChatUiState,
+        streamingState: StreamingState,
+        text: String?,
+        extraEffects: List<ReducerEffect> = emptyList(),
+    ): ReducerResult {
+        if (text.isNullOrBlank()) {
+            return ReducerResult(state = state, streamingState = streamingState, effects = extraEffects)
+        }
+        val turnStart = state.messages.indexOfLast { it.isUserTurnBoundary() } + 1
+        val duplicate =
+            state.messages.drop(turnStart).any { it.role == MessageRole.SYSTEM && it.content == text }
+        if (duplicate) return ReducerResult(state = state, streamingState = streamingState, effects = extraEffects)
+        val notice = ChatMessage(role = MessageRole.SYSTEM, content = text)
+        val sid = state.currentSessionId
+        return ReducerResult(
+            state = state.copy(messages = state.messages + notice),
+            streamingState = streamingState,
+            effects = extraEffects + listOfNotNull(sid?.let { ReducerEffect.PersistMessage(notice, it) }),
+        )
+    }
+
+    /**
+     * A turn whose final text is a gateway interrupt sentinel ends with a notice, not assistant prose (#1433).
+     * For the repetition-loop sentinel the gateway hides the looped partial; drop it here too, including a
+     * copy already sealed by Stop, or it lingers as a live-only row that jumps to the tail on every merge.
+     */
+    private fun onInterruptNotice(
+        state: ChatUiState,
+        streamingState: StreamingState,
+        event: WsEvent.MessageComplete,
+    ): ReducerResult {
+        val usageState = event.rawPayload?.let(::parseUsageSnapshot)?.let { applyUsageSnapshot(state, it) } ?: state
+        val text = event.text.trim()
+        val effects = mutableListOf<ReducerEffect>()
+        var messages = usageState.messages
+        if (text == GatewayNotice.REPETITION_LOOP_INTERRUPTED) {
+            val looped = setOfNotNull(streamingState.interruptedMessage?.id, streamingState.streamingMessage?.id)
+            if (looped.isNotEmpty()) {
+                messages = messages.filterNot { it.id in looped }
+                looped.forEach { effects += ReducerEffect.DeleteLocalMessage(it) }
+            }
+        } else {
+            // Other exits keep any real partial the user already saw.
+            streamingState.streamingMessage
+                ?.takeIf { it.content.isNotBlank() || it.reasoningText.isNotBlank() }
+                ?.copy(isStreaming = false, finishTimestamp = System.currentTimeMillis())
+                ?.let { partial ->
+                    messages = messages.upsertById(partial)
+                    usageState.currentSessionId?.let { effects += ReducerEffect.PersistMessage(partial, it) }
+                }
+        }
+        effects += ReducerEffect.RefreshSessions
+        effects += ReducerEffect.RefreshContextUsage
+        val settled = usageState.copy(messages = messages, isAgentTyping = false, clarifyRequest = null)
+        return appendGatewayNotice(settled, StreamingState(), text, effects)
+    }
+
+    /** Paints a live tapback on the row whose gateway id matches; unmatched rows arrive with the next REST load. */
+    private fun onMessageReaction(
+        state: ChatUiState,
+        streamingState: StreamingState,
+        event: WsEvent.MessageReactionUpdated,
+    ): ReducerResult {
+        if (state.messages.none { it.serverRowId == event.rowId }) {
+            return ReducerResult(state = state, streamingState = streamingState)
+        }
+        val messages =
+            state.messages.map {
+                if (it.serverRowId == event.rowId) it.copy(reactions = event.reactions) else it
+            }
+        return ReducerResult(state = state.copy(messages = messages), streamingState = streamingState)
+    }
 
     private fun onUnknown(
         state: ChatUiState,
@@ -928,7 +1212,11 @@ object ChatWsEventReducer {
         val toolIdx = findToolIndex(messages, event.name, event.toolId, ToolStatus.RUNNING)
         if (toolIdx < 0) return ReducerResult(state = state, streamingState = streamingState)
 
-        messages[toolIdx] = messages[toolIdx].copy(progressPreview = event.preview ?: "")
+        messages[toolIdx] =
+            messages[toolIdx].copy(
+                progressPreview = event.preview ?: "",
+                isHistoricalCache = false,
+            )
         return ReducerResult(
             state = state.copy(messages = messages),
             streamingState = streamingState,
@@ -944,14 +1232,14 @@ object ChatWsEventReducer {
         val toolIdx = findToolIndex(messages, event.name, event.toolId, ToolStatus.RUNNING)
         if (toolIdx < 0) return ReducerResult(state = state, streamingState = streamingState)
 
-        messages[toolIdx] = messages[toolIdx].copy(progressPreview = "")
+        messages[toolIdx] = messages[toolIdx].copy(progressPreview = "", isHistoricalCache = false)
         return ReducerResult(
             state = state.copy(messages = messages),
             streamingState = streamingState,
         )
     }
 
-    /** Match stable tool IDs first, with name matching for legacy events. */
+    /** Match an explicit stable ID exclusively; use name matching only when legacy events omit the ID. */
     private fun findToolIndex(
         messages: List<ChatMessage>,
         name: String?,
@@ -965,7 +1253,8 @@ object ChatWsEventReducer {
                         it.toolCallId == toolId &&
                         it.toolStatus == status
                 }
-            if (byId >= 0) return byId
+            // An explicit identity must never claim a different historical invocation.
+            return byId
         }
 
         return messages.indexOfLast {
@@ -1103,6 +1392,11 @@ sealed class ReducerEffect {
     data object RefreshSessions : ReducerEffect()
 
     data object RefreshContextUsage : ReducerEffect()
+
+    /** Drop a never-confirmed local row from Room (the DAO refuses rows that carry a REST identity). */
+    data class DeleteLocalMessage(
+        val messageId: String,
+    ) : ReducerEffect()
 
     /**
      * Ask the ViewModel to turn any `MEDIA:<host-path>` directives in the

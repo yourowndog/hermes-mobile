@@ -1,18 +1,24 @@
 package com.m57.hermescontrol.ui.chat
 
-import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.model.AttachmentSource
 import com.m57.hermescontrol.data.model.SessionMessage
-import com.m57.hermescontrol.data.remote.GatewayFileClient
-import com.m57.hermescontrol.notification.ReplyNotificationTracker
+import com.m57.hermescontrol.notification.ReplyNotificationTarget
+import com.m57.hermescontrol.ui.chat.tool.ToolJson
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Maps REST transcript rows ([SessionMessage]) into UI [ChatMessage]s.
  *
- * Reads the supplied transcript snapshot and recovers notification identity through
- * ReplyNotificationTracker's synchronized lookup. Safe on the history dispatcher;
- * it never mutates ViewModel state or dismisses a notification.
+ * Pure: every input is plain data. Callers resolve the active reply-notification
+ * target and the gateway media URL builder, so this never touches Android,
+ * AuthManager, or the notification tracker (#1337).
+ *
+ * @param activeReplyTarget the reply notification currently posted, if any; its
+ *   durable server row id reserves that row's completion identity.
+ * @param mediaUrl builds an authenticated gateway URL for a `MEDIA:` path, or null
+ *   when no gateway is configured.
+ * @param nowMs fallback timestamp for rows without one.
  */
 internal fun mapServerMessages(
     sessionId: String,
@@ -22,7 +28,9 @@ internal fun mapServerMessages(
     liveMessages: List<ChatMessage>,
     isPagingOlder: Boolean = false,
     stableRowIds: Boolean = latestPaging,
-    context: android.content.Context? = null,
+    activeReplyTarget: ReplyNotificationTarget? = null,
+    mediaUrl: (path: String) -> String? = { null },
+    nowMs: Long = System.currentTimeMillis(),
 ): List<ChatMessage> {
     val existingById = liveMessages.associateBy { it.canonicalRestId ?: it.id }
     val liveByExactId =
@@ -43,16 +51,17 @@ internal fun mapServerMessages(
 
     fun restIdAt(index: Int): String =
         if (stableRowIds) {
-            "rest-$sessionId-${requireNotNull(messages[index].id) { "Latest transcript row has no stable id" }}"
+            RestMessageId.of(sessionId, requireNotNull(messages[index].id) { "Latest transcript row has no stable id" })
         } else {
-            "rest-$sessionId-${offset + index}"
+            RestMessageId.of(sessionId, offset + index)
         }
 
     val wsCompletionIdByRestIndex = mutableMapOf<Int, String>()
+    val verifierContentByRestIndex = mutableMapOf<Int, String>()
     if (!isPagingOlder) {
         // #129: reserve durable identity before matching any repeated live prose.
         // REST-only recovery remains fail-closed when the target row is absent.
-        val activeTarget = ReplyNotificationTracker.getActiveTarget(context)?.takeIf { it.sessionId == sessionId }
+        val activeTarget = activeReplyTarget?.takeIf { it.sessionId == sessionId }
         val durableTarget = activeTarget?.takeIf { it.serverMessageId != null }
         if (durableTarget != null) {
             val exactIndex =
@@ -89,6 +98,27 @@ internal fun mapServerMessages(
                 remainingWs.removeAt(wsIdx).completionId?.let { wsCompletionIdByRestIndex[i] = it }
             }
         }
+        // Fallback: match live assistant containing a file-mutation verifier footer against
+        // its footer-free REST counterpart (issue #1241).
+        for (i in messages.indices.reversed()) {
+            if (remainingWs.isEmpty()) break
+            if (i in wsCompletionIdByRestIndex || restIdAt(i) in reservedRestIds) continue
+            val m = messages[i]
+            if (m.role?.lowercase() in listOf("user", "system", "tool")) continue
+            val rawContent = m.displayContentText ?: m.contentText
+            if (rawContent.isBlank()) continue
+            val canonicalContent =
+                if (rawContent.contains("MEDIA:")) HostMediaExtractor.strip(rawContent).trim() else rawContent.trim()
+            val wsIdx = remainingWs.indexOfLast { ChatVerifierFooter.matchesBase(it.content, canonicalContent) }
+            if (wsIdx >= 0) {
+                val matchedWs = remainingWs.removeAt(wsIdx)
+                matchedWs.completionId?.let { wsCompletionIdByRestIndex[i] = it }
+                // Propagate the richer live footer content to the REST row so canonical mapping keeps it
+                if (ChatVerifierFooter.split(matchedWs.content) != null) {
+                    verifierContentByRestIndex[i] = matchedWs.content
+                }
+            }
+        }
     }
 
     // Reasoning follows the same reserved identities as completions, never a reusable text lookup.
@@ -119,6 +149,19 @@ internal fun mapServerMessages(
             val match = remaining.indexOfLast { it.content.trim() == content }
             if (match >= 0) reasoningSources[index] = remaining.removeAt(match)
         }
+        for (index in messages.indices.reversed()) {
+            val row = messages[index]
+            val displayContent = row.displayContentText ?: row.contentText
+            if (reasoningSources[index] != null || displayContent.isBlank() ||
+                row.role?.lowercase() in listOf("user", "system", "tool") ||
+                liveByExactId[restIdAt(index)]?.completionId != null || index in wsCompletionIdByRestIndex
+            ) {
+                continue
+            }
+            val content = HostMediaExtractor.strip(displayContent).trim()
+            val match = remaining.indexOfLast { ChatVerifierFooter.matchesBase(it.content, content) }
+            if (match >= 0) reasoningSources[index] = remaining.removeAt(match)
+        }
     }
 
     val mapped = mutableListOf<ChatMessage>()
@@ -142,15 +185,32 @@ internal fun mapServerMessages(
                 ?.times(1000)
                 ?.toLong()
                 ?: existingById[restId]?.timestamp
-                ?: System.currentTimeMillis()
+                ?: nowMs
 
-        val rawContent = msg.displayContentText ?: msg.contentText
-        val rowReasoning =
-            msg.reasoningText.ifBlank {
-                if (role == MessageRole.ASSISTANT) {
-                    reasoningSources[index]?.reasoningText.orEmpty()
+        val rawContent =
+            if (role == MessageRole.TOOL && msg.display_metadata != null) {
+                // Enrich tool content with display_metadata so persisted edit previews
+                // (inline_diff) survive reload into the diff renderer
+                val parsedContent = ToolJson.parseMaybeObject(msg.content)
+                if (parsedContent != null && !parsedContent.containsKey("display_metadata")) {
+                    JsonObject(parsedContent + ("display_metadata" to msg.display_metadata)).toString()
                 } else {
-                    existingById[restId]?.reasoningText.orEmpty()
+                    msg.visibleText
+                }
+            } else {
+                msg.visibleText
+            }
+        // #1284: projected reasoning already excludes public commentary; it is authoritative.
+        val rowReasoning =
+            if (msg.hasDisplayReasoning) {
+                msg.displayReasoningText
+            } else {
+                msg.reasoningText.ifBlank {
+                    if (role == MessageRole.ASSISTANT) {
+                        reasoningSources[index]?.reasoningText.orEmpty()
+                    } else {
+                        existingById[restId]?.reasoningText.orEmpty()
+                    }
                 }
             }
 
@@ -166,25 +226,22 @@ internal fun mapServerMessages(
         var finalContent =
             if (role == MessageRole.USER) {
                 stripGatewayAttachedContext(stripGatewaySteerWrapper(rawContent))
+            } else if (role == MessageRole.ASSISTANT && verifierContentByRestIndex.containsKey(index)) {
+                verifierContentByRestIndex[index] ?: rawContent
             } else {
                 rawContent
             }
         var attachments: List<Attachment>? = null
-        if (role == MessageRole.ASSISTANT && rawContent.contains("MEDIA:")) {
+        if (role == MessageRole.USER) {
+            attachments = userImageAttachments(finalContent, mediaUrl).takeIf { it.isNotEmpty() }
+        } else if (role == MessageRole.ASSISTANT && rawContent.contains("MEDIA:")) {
             val items = HostMediaExtractor.extract(rawContent)
             if (items.isNotEmpty()) {
-                val baseUrl = AuthManager.getBaseUrl()
-                val token = AuthManager.getToken().orEmpty()
                 finalContent = HostMediaExtractor.strip(rawContent)
                 attachments =
                     items
                         .mapNotNull { item ->
-                            val url =
-                                GatewayFileClient.buildMediaUrl(
-                                    baseUrl,
-                                    token,
-                                    item.path,
-                                ) ?: return@mapNotNull null
+                            val url = mediaUrl(item.path) ?: return@mapNotNull null
                             Attachment(
                                 uri = url,
                                 name = mediaNameFromPath(item.path),
@@ -192,6 +249,7 @@ internal fun mapServerMessages(
                                 size = 0,
                                 gatewayUrl = url,
                                 source = AttachmentSource.GATEWAY,
+                                contentOffset = item.offset,
                             )
                         }.takeIf { it.isNotEmpty() }
             }
@@ -217,16 +275,30 @@ internal fun mapServerMessages(
                 displayKind = msg.display_kind,
                 tokenCount = tokenCount,
                 completionId = completionId,
-            ),
+                serverRowId = msg.id?.toLong()?.takeIf { it > 0L },
+                reactions = msg.reactions,
+            ).normalizedGatewayNotice(),
         )
     }
 
     // REST echoes must not reserve a match before the richer WS copy of that tool.
-    val liveTools = liveMessages.filter { it.role == MessageRole.TOOL && !it.id.startsWith("rest-") }
+    val liveTools = liveMessages.filter { it.role == MessageRole.TOOL && !RestMessageId.isRest(it.id) }
     val mappedTools = mapped.filter { it.role == MessageRole.TOOL }
     val matches = matchTranscriptMessages(mappedTools, liveTools)
     val toolsById = mappedTools.indices.associate { index -> mappedTools[index].id to matches[index] }
     return mapped.map { message ->
-        toolsById[message.id]?.copy(restId = message.canonicalRestId) ?: message
+        val local = toolsById[message.id]
+        if (local?.isHistoricalCache == true && local.toolStatus == ToolStatus.RUNNING) {
+            // A canonical tool-result row settles a cached tool.start, not the reverse.
+            local.copy(
+                restId = message.canonicalRestId,
+                serverRowId = message.serverRowId,
+                content = message.content,
+                toolStatus = ToolStatus.COMPLETED,
+                isHistoricalCache = false,
+            )
+        } else {
+            local?.copy(restId = message.canonicalRestId, serverRowId = message.serverRowId) ?: message
+        }
     }
 }

@@ -13,16 +13,16 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -39,15 +39,18 @@ import com.m57.hermescontrol.ui.chat.ChatMessage
 import com.m57.hermescontrol.ui.chat.ImageViewerModel
 import com.m57.hermescontrol.ui.chat.InlineAttachment
 import com.m57.hermescontrol.ui.chat.MarkdownText
+import com.m57.hermescontrol.ui.chat.MessageSegment
 import com.m57.hermescontrol.ui.chat.TokenEstimator
+import com.m57.hermescontrol.ui.chat.components.MessageReactionChips
 import com.m57.hermescontrol.ui.chat.components.ReasoningCard
-import kotlinx.coroutines.delay
+import com.m57.hermescontrol.ui.chat.components.rememberCopyFeedback
+import com.m57.hermescontrol.ui.chat.splitByMedia
 import kotlinx.coroutines.launch
 
 /**
  * Full-bleed renderer for ONE agent (assistant) message (issue #866).
  *
- * Unlike [com.m57.hermescontrol.ui.chat.ChatBubble], agent prose renders
+ * Unlike [com.m57.hermescontrol.ui.chat.UserBubble], agent prose renders
  * directly on the background — no bubble container, no width cap — with a
  * trailing copy affordance. User messages keep their bubbles; this composable
  * is only used for ASSISTANT messages.
@@ -58,6 +61,9 @@ internal fun FullBleedAgentMessage(
     message: ChatMessage,
     searchQuery: String = "",
     isCurrentMatch: Boolean = false,
+    reasoningSearchQuery: String = "",
+    isCurrentReasoningMatch: Boolean = false,
+    reasoningSearchOffset: Int = 0,
     showReasoning: Boolean = true,
     onOpenAttachment: (Attachment) -> Unit = {},
     onSaveAttachment: (Attachment) -> Unit = {},
@@ -65,6 +71,8 @@ internal fun FullBleedAgentMessage(
     openingAttachmentPath: String? = null,
     canSaveAttachment: Boolean = true,
     onImageClick: (ImageViewerModel) -> Unit = {},
+    isSpeaking: Boolean = false,
+    onToggleSpeak: (() -> Unit)? = null,
     messageStatsEnabled: Boolean = false,
     showAssistantMessageTokens: Boolean = true,
     showTokensPerSecond: Boolean = true,
@@ -73,15 +81,8 @@ internal fun FullBleedAgentMessage(
     val textColor = MaterialTheme.colorScheme.onSurface
     val clipboard = LocalClipboard.current
     val scope = rememberCoroutineScope()
-    var copied by remember { mutableStateOf(false) }
-
     // Copy feedback: briefly show ✓ then revert
-    LaunchedEffect(copied) {
-        if (copied) {
-            delay(1500)
-            copied = false
-        }
-    }
+    var copied by rememberCopyFeedback()
 
     Column(
         modifier =
@@ -94,6 +95,9 @@ internal fun FullBleedAgentMessage(
             ReasoningCard(
                 reasoningText = message.reasoningText,
                 isStreaming = message.isStreaming,
+                searchQuery = reasoningSearchQuery,
+                isCurrentMatch = isCurrentReasoningMatch,
+                searchOffset = reasoningSearchOffset,
             )
             Spacer(modifier = Modifier.height(6.dp))
         }
@@ -102,36 +106,46 @@ internal fun FullBleedAgentMessage(
         // lone Copy button). Blank rows are tool-call placeholders that slipped
         // through upstream mapping; the parent list renders the live status
         // indicator until the first visible delta lands.
-        if (message.content.isNotBlank()) {
-            SelectionContainer {
-                MarkdownText(
-                    text = message.content,
-                    textColor = textColor,
-                    isStreaming = message.isStreaming,
-                    searchQuery = searchQuery,
-                    isCurrentMatch = isCurrentMatch,
-                    onImageClick = onImageClick,
-                )
+        // Issue #1367: agent media renders where its `MEDIA:` directive sat in the
+        // prose; attachments without a recorded position trail the text.
+        val segments =
+            remember(message.content, message.attachments) {
+                splitByMedia(message.content, message.attachments)
+            }
+        segments.forEach { segment ->
+            when (segment) {
+                is MessageSegment.Text -> {
+                    SelectionContainer {
+                        MarkdownText(
+                            text = segment.text,
+                            textColor = textColor,
+                            isStreaming = message.isStreaming,
+                            searchQuery = searchQuery,
+                            isCurrentMatch = isCurrentMatch,
+                            onImageClick = onImageClick,
+                        )
+                    }
+                }
+
+                is MessageSegment.Media -> {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    InlineAttachment(
+                        attachment = segment.attachment,
+                        textColor = textColor,
+                        onOpen = onOpenAttachment,
+                        onSave = onSaveAttachment,
+                        savingPath = savingAttachmentPath,
+                        openingPath = openingAttachmentPath,
+                        canSave = canSaveAttachment,
+                        onImageClick = onImageClick,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
             }
         }
 
-        // Render inline attachments (mirrors ChatBubble so agent-delivered
-        // media — images, files — shows in full-bleed mode too).
-        if (!message.attachments.isNullOrEmpty()) {
-            Spacer(modifier = Modifier.height(6.dp))
-            message.attachments.forEach { attachment ->
-                InlineAttachment(
-                    attachment = attachment,
-                    textColor = textColor,
-                    onOpen = { onOpenAttachment(it) },
-                    onSave = { onSaveAttachment(it) },
-                    savingPath = savingAttachmentPath,
-                    openingPath = openingAttachmentPath,
-                    canSave = canSaveAttachment,
-                    onImageClick = onImageClick,
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-            }
+        if (!message.isStreaming) {
+            MessageReactionChips(message.reactions, Modifier.padding(top = 2.dp))
         }
 
         if (!message.isStreaming && message.content.isNotBlank()) {
@@ -161,6 +175,31 @@ internal fun FullBleedAgentMessage(
                         modifier = Modifier.size(14.dp),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                }
+                if (onToggleSpeak != null) {
+                    IconButton(
+                        onClick = onToggleSpeak,
+                        modifier = Modifier.size(28.dp).testTag("fullbleed_speak"),
+                    ) {
+                        Icon(
+                            imageVector =
+                                if (isSpeaking) {
+                                    Icons.Filled.Stop
+                                } else {
+                                    Icons.AutoMirrored.Filled.VolumeUp
+                                },
+                            contentDescription =
+                                stringResource(
+                                    if (isSpeaking) {
+                                        R.string.content_desc_stop_speaking
+                                    } else {
+                                        R.string.content_desc_speak
+                                    },
+                                ),
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
                 if (showTokenStat) {
                     AssistantStatItem(

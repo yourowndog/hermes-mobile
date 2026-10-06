@@ -3,11 +3,15 @@ package com.m57.hermescontrol.ui.chat.fullbleed
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
@@ -28,26 +32,48 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
 import com.m57.hermescontrol.theme.LocalChatFontScale
-import com.m57.hermescontrol.ui.chat.ChatBubble
 import com.m57.hermescontrol.ui.chat.ChatMessage
 import com.m57.hermescontrol.ui.chat.ChatSearchState
-import com.m57.hermescontrol.ui.chat.ChatViewModel
-import com.m57.hermescontrol.ui.chat.ClarifyUi
 import com.m57.hermescontrol.ui.chat.ImageViewerModel
-import com.m57.hermescontrol.ui.chat.StreamingState
+import com.m57.hermescontrol.ui.chat.PendingSendState
+import com.m57.hermescontrol.ui.chat.SearchTarget
 import com.m57.hermescontrol.ui.chat.ToolCallDivider
-import com.m57.hermescontrol.ui.chat.VaultCodePromptUi
-import com.m57.hermescontrol.ui.chat.VaultSaveLoginPromptUi
-import com.m57.hermescontrol.ui.chat.VaultUnlockPromptUi
+import com.m57.hermescontrol.ui.chat.UserBubble
 import com.m57.hermescontrol.ui.chat.components.ChatHistoryPrefetch
 import com.m57.hermescontrol.ui.chat.components.ChatScrollController
 import com.m57.hermescontrol.ui.chat.components.ClarifyBubble
+import com.m57.hermescontrol.ui.chat.components.MessageReactionChips
 import com.m57.hermescontrol.ui.chat.components.ReasoningCard
 import com.m57.hermescontrol.ui.chat.components.VaultCodeCard
 import com.m57.hermescontrol.ui.chat.components.VaultSaveLoginCard
 import com.m57.hermescontrol.ui.chat.components.VaultUnlockCard
 import com.m57.hermescontrol.ui.chat.toolCallMilestones
 import com.m57.hermescontrol.ui.common.EmptyState
+
+private object FullBleedContentType {
+    const val USER: String = "user"
+    const val REASONING: String = "reasoning"
+    const val PROSE: String = "prose"
+    const val TOOL: String = "tool"
+    const val SYSTEM_EVENT: String = "system_event"
+}
+
+/** Only show the placeholder when there are no messages or renderable live tail items. */
+internal fun shouldShowChatEmptyState(
+    transcript: TranscriptUiState,
+    hasReplyError: Boolean,
+): Boolean =
+    transcript.messages.isEmpty() &&
+        transcript.streamingState.streamingMessage == null &&
+        !transcript.isLoading &&
+        !transcript.isAgentTyping &&
+        !hasReplyError &&
+        transcript.clarifyRequest == null &&
+        transcript.vaultUnlockPrompt == null &&
+        transcript.vaultSaveLoginPrompt == null &&
+        transcript.vaultCodePrompt == null &&
+        !transcript.isCompressing &&
+        transcript.compressionStatus == null
 
 /**
  * The chat message list for FULL-BLEED style (issue #866) — the single chat
@@ -66,46 +92,37 @@ import com.m57.hermescontrol.ui.common.EmptyState
  */
 @Composable
 fun FullBleedChatList(
-    messages: List<ChatMessage>,
-    streamingState: StreamingState,
-    isAgentTyping: Boolean,
+    transcript: TranscriptUiState,
+    actions: TranscriptActions,
     searchState: ChatSearchState,
-    typingEffectEnabled: Boolean,
-    typingEffectDelayMs: Int,
-    messageStatsEnabled: Boolean = false,
-    showUserMessageTokens: Boolean = true,
-    showAssistantMessageTokens: Boolean = true,
-    showTokensPerSecond: Boolean = true,
-    maxToolCallsPerTurn: Int? = null,
-    isLoading: Boolean,
-    isLoadingOlder: Boolean,
     listState: androidx.compose.foundation.lazy.LazyListState,
     scrollController: ChatScrollController,
-    lastAnimatedMessageId: String?,
-    onLastAnimatedMessageIdChange: (String?) -> Unit,
-    viewModel: ChatViewModel,
-    clarifyRequest: ClarifyUi? = null,
-    onRespondClarify: ((String) -> Unit)? = null,
-    onRespondClarifyBatch: ((Map<String, String>) -> Unit)? = null,
-    onDismissClarify: (() -> Unit)? = null,
-    vaultUnlockPrompt: VaultUnlockPromptUi? = null,
-    onRespondVaultUnlock: ((String) -> Unit)? = null,
-    onDismissVaultUnlock: (() -> Unit)? = null,
-    vaultSaveLoginPrompt: VaultSaveLoginPromptUi? = null,
-    onRespondVaultSaveLogin: ((String, String) -> Unit)? = null,
-    onDismissVaultSaveLogin: (() -> Unit)? = null,
-    vaultCodePrompt: VaultCodePromptUi? = null,
-    onRespondVaultCode: ((String) -> Unit)? = null,
-    onDismissVaultCode: (() -> Unit)? = null,
-    onSaveAttachment: (com.m57.hermescontrol.data.model.Attachment) -> Unit = {},
-    savingAttachmentPath: String? = null,
-    openingAttachmentPath: String? = null,
-    onImageClick: (ImageViewerModel) -> Unit = {},
-    hasOlderMessages: Boolean = false,
-    pagingSessionId: String? = null,
-    onLoadOlder: () -> Unit = viewModel::loadOlderMessages,
+    replyErrorContent: (@Composable () -> Unit)? = null,
 ) {
-    if (messages.isEmpty() && !isLoading && !isAgentTyping) {
+    val messages = transcript.messages
+    val streamingState = transcript.streamingState
+    val isAgentTyping = transcript.isAgentTyping
+    val typingEffectEnabled = transcript.typingEffectEnabled
+    val typingEffectDelayMs = transcript.typingEffectDelayMs
+    val messageStatsEnabled = transcript.messageStatsEnabled
+    val showUserMessageTokens = transcript.showUserMessageTokens
+    val showAssistantMessageTokens = transcript.showAssistantMessageTokens
+    val showTokensPerSecond = transcript.showTokensPerSecond
+    val maxToolCallsPerTurn = transcript.maxToolCallsPerTurn
+    val isLoading = transcript.isLoading
+    val isLoadingOlder = transcript.isLoadingOlder
+    val hasOlderMessages = transcript.hasOlderMessages
+    val pagingSessionId = transcript.pagingSessionId
+    val clarifyRequest = transcript.clarifyRequest
+    val vaultUnlockPrompt = transcript.vaultUnlockPrompt
+    val vaultSaveLoginPrompt = transcript.vaultSaveLoginPrompt
+    val vaultCodePrompt = transcript.vaultCodePrompt
+    val savingAttachmentPath = transcript.savingAttachmentPath
+    val openingAttachmentPath = transcript.openingAttachmentPath
+    val isCompressing = transcript.isCompressing
+    val compressionStatus = transcript.compressionStatus
+    val speakingMessageId = transcript.speakingMessageId
+    if (shouldShowChatEmptyState(transcript, hasReplyError = replyErrorContent != null)) {
         Box(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center,
@@ -145,6 +162,24 @@ fun FullBleedChatList(
         // A single ordered definition supplies both emitted tail rows and anchor keys.
         val tailItems =
             buildMap<String, @Composable () -> Unit> {
+                replyErrorContent?.let { put("reply_error", it) }
+                if (isCompressing || compressionStatus != null) {
+                    put("compression_status") {
+                        Row(
+                            modifier =
+                                Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = compressionStatus ?: "⏳ Compressing context...",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
                 agentStatus?.let { status ->
                     put("agent_status") {
                         AgentStatusIndicator(status = status)
@@ -156,9 +191,9 @@ fun FullBleedChatList(
                     put("clarify_bubble") {
                         ClarifyBubble(
                             clarifyRequest = clarifyRequest,
-                            onRespondSingle = { option -> onRespondClarify?.invoke(option) },
-                            onRespondBatch = { answers -> onRespondClarifyBatch?.invoke(answers) },
-                            onDismiss = { onDismissClarify?.invoke() },
+                            onRespondSingle = actions.onRespondClarify,
+                            onRespondBatch = actions.onRespondClarifyBatch,
+                            onDismiss = actions.onDismissClarify,
                         )
                     }
                 }
@@ -167,8 +202,8 @@ fun FullBleedChatList(
                     put("vault_unlock_card") {
                         VaultUnlockCard(
                             prompt = vaultUnlockPrompt,
-                            onConfirm = { password -> onRespondVaultUnlock?.invoke(password) },
-                            onDismiss = { onDismissVaultUnlock?.invoke() },
+                            onConfirm = actions.onRespondVaultUnlock,
+                            onDismiss = actions.onDismissVaultUnlock,
                         )
                     }
                 }
@@ -177,10 +212,8 @@ fun FullBleedChatList(
                     put("vault_save_login_card") {
                         VaultSaveLoginCard(
                             prompt = vaultSaveLoginPrompt,
-                            onConfirm = { identifier, password ->
-                                onRespondVaultSaveLogin?.invoke(identifier, password)
-                            },
-                            onDismiss = { onDismissVaultSaveLogin?.invoke() },
+                            onConfirm = actions.onRespondVaultSaveLogin,
+                            onDismiss = actions.onDismissVaultSaveLogin,
                         )
                     }
                 }
@@ -189,8 +222,8 @@ fun FullBleedChatList(
                     put("vault_code_card") {
                         VaultCodeCard(
                             prompt = vaultCodePrompt,
-                            onConfirm = { code -> onRespondVaultCode?.invoke(code) },
-                            onDismiss = { onDismissVaultCode?.invoke() },
+                            onConfirm = actions.onRespondVaultCode,
+                            onDismiss = actions.onDismissVaultCode,
                         )
                     }
                 }
@@ -216,7 +249,7 @@ fun FullBleedChatList(
         }
         val prefetch = remember(pagingSessionId) { ChatHistoryPrefetch() }
         val canLoad = rememberUpdatedState(hasOlderMessages && !isLoadingOlder && !isLoading)
-        val loadOlder = rememberUpdatedState(onLoadOlder)
+        val loadOlder = rememberUpdatedState(actions.onLoadOlder)
         val prefetchConnection =
             remember(listState, prefetch, scrollController) {
                 object : NestedScrollConnection {
@@ -224,6 +257,9 @@ fun FullBleedChatList(
                         available: Offset,
                         source: NestedScrollSource,
                     ): Offset {
+                        if (source == NestedScrollSource.UserInput && available.y > 0f) {
+                            scrollController.onUserScrollUp()
+                        }
                         if (prefetch.onScroll(
                                 firstVisibleIndex = listState.firstVisibleItemIndex,
                                 deltaY = available.y,
@@ -244,32 +280,13 @@ fun FullBleedChatList(
             }
         }
 
-        // Scroll the current search match into view, word-focused. Lives here
-        // (not in ChatLifecycleEffects) because only this composable knows
-        // the message-id → lazy-item-index mapping. Reads search fields in
-        // the effect (not the body), so only this effect restarts on change.
-        LaunchedEffect(
-            searchState.isActive,
-            searchState.currentIndex,
-            searchState.matchIndices,
-            searchState.matchOffsets,
-            renderedMessages.firstOrNull()?.id,
-        ) {
-            if (searchState.isActive &&
-                searchState.currentIndex >= 0 &&
-                searchState.currentIndex < searchState.matchIndices.size
-            ) {
-                val messageIndex = searchState.matchIndices[searchState.currentIndex]
-                if (messageIndex < 0 || messageIndex >= messages.size) return@LaunchedEffect
-                // Search indices refer to incoming messages; resolve by id into the
-                // rendered rows. A hit in a staged prefix is retried when it becomes visible.
-                val lazyIndexById = messageIdToLazyIndex(turns)
-                val lazyIndex = lazyIndexById[messages[messageIndex].id] ?: return@LaunchedEffect
-                val contentOffset = searchState.matchOffsets.getOrElse(searchState.currentIndex) { 0 }
-                val contentLength = messages[messageIndex].content.length
-                scrollController.scrollToSearchMatch(lazyIndex, contentOffset, contentLength)
-            }
-        }
+        ChatSearchScrollEffect(
+            searchState = searchState,
+            messages = messages,
+            renderedFirstId = renderedMessages.firstOrNull()?.id,
+            turns = turns,
+            scrollController = scrollController,
+        )
 
         val currentDensity = LocalDensity.current
         val chatFontScale = LocalChatFontScale.current
@@ -294,22 +311,35 @@ fun FullBleedChatList(
                                 // Eager captures: item lambda reads these at
                                 // composition time (lazy), so capture now.
                                 val userMessage = turn.message
-                                item(key = "user-${userMessage.id}") {
+                                item(
+                                    key = "user-${userMessage.id}",
+                                    contentType = FullBleedContentType.USER,
+                                ) {
                                     Column(modifier = Modifier.padding(bottom = 12.dp)) {
-                                        renderChatBubble(
+                                        renderUserBubble(
                                             message = userMessage,
                                             searchQuery = if (searchState.isActive) searchState.query else "",
                                             isCurrentMatch =
                                                 searchState.currentMatchId != null &&
                                                     searchState.currentMatchId == userMessage.id,
-                                            onOpenAttachment = viewModel::openAttachment,
-                                            onSaveAttachment = onSaveAttachment,
+                                            onOpenAttachment = actions.onOpenAttachment,
+                                            onSaveAttachment = actions.onSaveAttachment,
                                             savingAttachmentPath = savingAttachmentPath,
                                             openingAttachmentPath = openingAttachmentPath,
-                                            onImageClick = onImageClick,
+                                            onImageClick = actions.onImageClick,
                                             messageStatsEnabled = messageStatsEnabled,
                                             showUserMessageTokens = showUserMessageTokens,
+                                            pendingSendState = transcript.pendingSendStates[userMessage.id],
                                         )
+                                        if (userMessage.reactions.isNotEmpty()) {
+                                            MessageReactionChips(
+                                                reactions = userMessage.reactions,
+                                                modifier =
+                                                    Modifier
+                                                        .align(Alignment.End)
+                                                        .padding(horizontal = 12.dp),
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -325,11 +355,30 @@ fun FullBleedChatList(
                                         .firstOrNull { it.message.reasoningText.isNotBlank() }
                                 if (turnReasoning != null) {
                                     val reasoning = turnReasoning.message
-                                    item(key = "reasoning-${reasoning.id}") {
+                                    item(
+                                        key = "reasoning-${reasoning.id}",
+                                        contentType = FullBleedContentType.REASONING,
+                                    ) {
                                         Column(modifier = Modifier.padding(bottom = 6.dp)) {
                                             ReasoningCard(
                                                 reasoningText = reasoning.reasoningText,
                                                 isStreaming = reasoning.isStreaming,
+                                                searchQuery =
+                                                    if (reasoning.id in
+                                                        searchState.matchedIds
+                                                    ) {
+                                                        searchState.query
+                                                    } else {
+                                                        ""
+                                                    },
+                                                isCurrentMatch =
+                                                    searchState.currentMatchId == reasoning.id &&
+                                                        searchState.matchTargets.getOrNull(searchState.currentIndex) ==
+                                                        SearchTarget.REASONING,
+                                                searchOffset =
+                                                    searchState.matchOffsets.getOrElse(
+                                                        searchState.currentIndex,
+                                                    ) { 0 },
                                             )
                                         }
                                     }
@@ -344,15 +393,37 @@ fun FullBleedChatList(
                                             if (!proseMessage.hasVisibleAgentContent() && !hoistedReasoning &&
                                                 proseMessage.reasoningText.isNotBlank()
                                             ) {
-                                                item(key = "reasoning-${proseMessage.id}") {
+                                                item(
+                                                    key = "reasoning-${proseMessage.id}",
+                                                    contentType = FullBleedContentType.REASONING,
+                                                ) {
                                                     ReasoningCard(
                                                         reasoningText = proseMessage.reasoningText,
                                                         isStreaming = proseMessage.isStreaming,
+                                                        searchQuery =
+                                                            if (proseMessage.id in searchState.matchedIds) {
+                                                                searchState.query
+                                                            } else {
+                                                                ""
+                                                            },
+                                                        isCurrentMatch =
+                                                            searchState.currentMatchId == proseMessage.id &&
+                                                                searchState.matchTargets.getOrNull(
+                                                                    searchState.currentIndex,
+                                                                ) ==
+                                                                SearchTarget.REASONING,
+                                                        searchOffset =
+                                                            searchState.matchOffsets.getOrElse(
+                                                                searchState.currentIndex,
+                                                            ) { 0 },
                                                     )
                                                 }
                                             }
                                             if (proseMessage.hasVisibleAgentContent()) {
-                                                item(key = "prose-${proseMessage.id}") {
+                                                item(
+                                                    key = "prose-${proseMessage.id}",
+                                                    contentType = FullBleedContentType.PROSE,
+                                                ) {
                                                     Column(modifier = Modifier.padding(bottom = 12.dp)) {
                                                         if (proseMessage.isStreaming && typingEffectEnabled) {
                                                             StreamingFullBleedWithTypingEffect(
@@ -361,6 +432,11 @@ fun FullBleedChatList(
                                                                 showReasoning = !hoistedReasoning,
                                                             )
                                                         } else {
+                                                            val isSpeakingThis =
+                                                                speakingMessageId != null &&
+                                                                    speakingMessageId == proseMessage.id
+                                                            val toggleSpeakAction =
+                                                                { actions.onToggleSpeak(proseMessage) }
                                                             FullBleedAgentMessage(
                                                                 message = proseMessage,
                                                                 // Highlight only bubbles that actually contain a match —
@@ -374,15 +450,38 @@ fun FullBleedChatList(
                                                                         ""
                                                                     },
                                                                 isCurrentMatch =
-                                                                    searchState.currentMatchId != null &&
-                                                                        searchState.currentMatchId == proseMessage.id,
+                                                                    searchState.currentMatchId == proseMessage.id &&
+                                                                        searchState.matchTargets.getOrNull(
+                                                                            searchState.currentIndex,
+                                                                        ) ==
+                                                                        SearchTarget.CONTENT,
+                                                                reasoningSearchQuery =
+                                                                    if (searchState.isActive &&
+                                                                        proseMessage.id in searchState.matchedIds
+                                                                    ) {
+                                                                        searchState.query
+                                                                    } else {
+                                                                        ""
+                                                                    },
+                                                                isCurrentReasoningMatch =
+                                                                    searchState.currentMatchId == proseMessage.id &&
+                                                                        searchState.matchTargets.getOrNull(
+                                                                            searchState.currentIndex,
+                                                                        ) ==
+                                                                        SearchTarget.REASONING,
+                                                                reasoningSearchOffset =
+                                                                    searchState.matchOffsets.getOrElse(
+                                                                        searchState.currentIndex,
+                                                                    ) { 0 },
                                                                 showReasoning = !hoistedReasoning,
-                                                                onOpenAttachment = viewModel::openAttachment,
-                                                                onSaveAttachment = onSaveAttachment,
+                                                                onOpenAttachment = actions.onOpenAttachment,
+                                                                onSaveAttachment = actions.onSaveAttachment,
                                                                 savingAttachmentPath = savingAttachmentPath,
                                                                 openingAttachmentPath = openingAttachmentPath,
                                                                 canSaveAttachment = savingAttachmentPath == null,
-                                                                onImageClick = onImageClick,
+                                                                onImageClick = actions.onImageClick,
+                                                                isSpeaking = isSpeakingThis,
+                                                                onToggleSpeak = toggleSpeakAction,
                                                                 messageStatsEnabled = messageStatsEnabled,
                                                                 showAssistantMessageTokens = showAssistantMessageTokens,
                                                                 showTokensPerSecond = showTokensPerSecond,
@@ -396,9 +495,26 @@ fun FullBleedChatList(
                                         is AgentEntry.ToolRow -> {
                                             val toolMessage = entry.message
                                             val milestone = toolMilestones[toolMessage.id]
-                                            item(key = "tool-${toolMessage.id}") {
+                                            item(
+                                                key = "tool-${toolMessage.id}",
+                                                contentType = FullBleedContentType.TOOL,
+                                            ) {
                                                 Column(modifier = Modifier.padding(bottom = 6.dp)) {
-                                                    FullBleedToolRow(toolMessage)
+                                                    FullBleedToolRow(
+                                                        message = toolMessage,
+                                                        searchQuery =
+                                                            if (toolMessage.id in searchState.matchedIds) {
+                                                                searchState.query
+                                                            } else {
+                                                                ""
+                                                            },
+                                                        isCurrentMatch =
+                                                            searchState.currentMatchId == toolMessage.id &&
+                                                                searchState.matchTargets.getOrNull(
+                                                                    searchState.currentIndex,
+                                                                ) ==
+                                                                SearchTarget.TOOL,
+                                                    )
                                                     milestone?.let { count ->
                                                         ToolCallDivider(count = count, maxPerTurn = maxToolCallsPerTurn)
                                                     }
@@ -408,7 +524,10 @@ fun FullBleedChatList(
 
                                         is AgentEntry.SystemEvent -> {
                                             val sysMessage = entry.message
-                                            item(key = "sys-${sysMessage.id}") {
+                                            item(
+                                                key = "sys-${sysMessage.id}",
+                                                contentType = FullBleedContentType.SYSTEM_EVENT,
+                                            ) {
                                                 Column(modifier = Modifier.padding(bottom = 6.dp)) {
                                                     if (sysMessage.displayKind != null) {
                                                         // Timeline marker (issue #904):
@@ -418,7 +537,7 @@ fun FullBleedChatList(
                                                     } else {
                                                         FullBleedSystemEvent(
                                                             message = sysMessage,
-                                                            onRespondApproval = viewModel::respondToApproval,
+                                                            onRespondApproval = actions.onRespondApproval,
                                                         )
                                                     }
                                                 }
@@ -431,7 +550,11 @@ fun FullBleedChatList(
                     }
 
                     tailItems.forEach { (key, content) ->
-                        item(key = key) { content() }
+                        item(
+                            key = key,
+                            // Tail keys are fixed per kind, so the key doubles as the slot type.
+                            contentType = key,
+                        ) { content() }
                     }
                 }
                 // Loading history must never become the list's first visible anchor.
@@ -446,7 +569,7 @@ fun FullBleedChatList(
 }
 
 @Composable
-private fun renderChatBubble(
+private fun renderUserBubble(
     message: ChatMessage,
     searchQuery: String,
     isCurrentMatch: Boolean,
@@ -457,8 +580,9 @@ private fun renderChatBubble(
     onImageClick: (ImageViewerModel) -> Unit,
     messageStatsEnabled: Boolean,
     showUserMessageTokens: Boolean,
+    pendingSendState: PendingSendState?,
 ) {
-    ChatBubble(
+    UserBubble(
         message = message,
         searchQuery = searchQuery,
         isCurrentMatch = isCurrentMatch,
@@ -470,5 +594,6 @@ private fun renderChatBubble(
         onImageClick = onImageClick,
         messageStatsEnabled = messageStatsEnabled,
         showUserMessageTokens = showUserMessageTokens,
+        pendingSendState = pendingSendState,
     )
 }

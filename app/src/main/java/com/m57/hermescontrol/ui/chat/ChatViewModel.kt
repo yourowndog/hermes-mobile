@@ -5,39 +5,75 @@ import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.m57.hermescontrol.R
 import com.m57.hermescontrol.data.local.AuthManager
+import com.m57.hermescontrol.data.local.DataScope
 import com.m57.hermescontrol.data.local.HermesDatabase
 import com.m57.hermescontrol.data.local.SlashUsageStore
 import com.m57.hermescontrol.data.model.Attachment
+import com.m57.hermescontrol.data.model.BusySendMode
 import com.m57.hermescontrol.data.model.ModelCapabilities
 import com.m57.hermescontrol.data.model.ModelProvider
 import com.m57.hermescontrol.data.model.PinnedModel
+import com.m57.hermescontrol.data.model.SessionCompressResponse
 import com.m57.hermescontrol.data.model.SessionTimelineEntry
 import com.m57.hermescontrol.data.model.UsageSnapshotResponse
 import com.m57.hermescontrol.data.model.parseContextBreakdown
 import com.m57.hermescontrol.data.model.parseUsageSnapshot
 import com.m57.hermescontrol.data.model.reasoningSupport
 import com.m57.hermescontrol.data.remote.ApiClient
+import com.m57.hermescontrol.data.remote.GatewayFileClient
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.remote.OkHttpProvider
 import com.m57.hermescontrol.data.remote.safeApiCall
+import com.m57.hermescontrol.data.repository.VoiceNoteRepository
 import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
 import com.m57.hermescontrol.data.ws.CommandBlocklist
 import com.m57.hermescontrol.data.ws.CommandCatalog
 import com.m57.hermescontrol.data.ws.ConnectionOperationParser
 import com.m57.hermescontrol.data.ws.ConnectionStatus
+import com.m57.hermescontrol.data.ws.EventParser
 import com.m57.hermescontrol.data.ws.HermesWsClient
+import com.m57.hermescontrol.data.ws.JsonRpcError
 import com.m57.hermescontrol.data.ws.WsEvent
 import com.m57.hermescontrol.data.ws.WsMethods
+import com.m57.hermescontrol.data.ws.contract.CommandDispatchParams
+import com.m57.hermescontrol.data.ws.contract.CommandsCatalogParams
+import com.m57.hermescontrol.data.ws.contract.ConfigGetParams
+import com.m57.hermescontrol.data.ws.contract.ConfigSetParams
+import com.m57.hermescontrol.data.ws.contract.DESKTOP_SESSION_SOURCE
+import com.m57.hermescontrol.data.ws.contract.FileAttachParams
+import com.m57.hermescontrol.data.ws.contract.ImageAttachBytesParams
+import com.m57.hermescontrol.data.ws.contract.ProcessStopParams
+import com.m57.hermescontrol.data.ws.contract.PromptBtwParams
+import com.m57.hermescontrol.data.ws.contract.RpcMethod
+import com.m57.hermescontrol.data.ws.contract.RpcMethods
+import com.m57.hermescontrol.data.ws.contract.SessionBranchParams
+import com.m57.hermescontrol.data.ws.contract.SessionBranchWholeParams
+import com.m57.hermescontrol.data.ws.contract.SessionCompressParams
+import com.m57.hermescontrol.data.ws.contract.SessionCorrectionParams
+import com.m57.hermescontrol.data.ws.contract.SessionCreateParams
+import com.m57.hermescontrol.data.ws.contract.SessionIdParams
+import com.m57.hermescontrol.data.ws.contract.SessionInterruptParams
+import com.m57.hermescontrol.data.ws.contract.SessionListParams
+import com.m57.hermescontrol.data.ws.contract.SessionResumeParams
+import com.m57.hermescontrol.data.ws.contract.SlashExecParams
+import com.m57.hermescontrol.data.ws.contract.TypedRpcSender
 import com.m57.hermescontrol.data.ws.toAny
 import com.m57.hermescontrol.data.ws.toJsonElement
+import com.m57.hermescontrol.notification.ReplyNotificationTracker
 import com.m57.hermescontrol.notification.captureTurnBoundary
 import com.m57.hermescontrol.notification.correlationScopeId
+import com.m57.hermescontrol.ui.chat.fullbleed.TranscriptUiState
+import com.m57.hermescontrol.ui.chat.tool.ToolViewCache
 import com.m57.hermescontrol.ui.common.ActionProgressController
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,8 +81,12 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -64,6 +104,12 @@ private const val TAG = "ChatViewModel"
 private const val MESSAGE_PAGE_SIZE = 150
 private const val TIMELINE_PAGE_SIZE = 500
 private const val HISTORY_WINDOW_SIZE = 120
+private const val MAX_PENDING_RECEIPT_LOOKUPS = 8
+private const val VOICE_NOTE_OFFLINE_MESSAGE = "Voice note not sent — not connected"
+private const val VOICE_NOTE_EMPTY_MESSAGE = "No speech detected in the voice note"
+private const val VOICE_NOTE_FAILED_MESSAGE = "Voice note transcription failed"
+private const val VOICE_NOTE_UNSENT_MESSAGE =
+    "Voice note not sent — transcript kept in the input field"
 
 private val REASONING_EFFORT_LEVELS =
     setOf("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -106,6 +152,10 @@ private data class PreparedAttachment(
     val encodedFile: File,
 )
 
+private class QueuedAttachmentTooLargeException(
+    val attachment: Attachment,
+) : Exception("Attachment too large: ${attachment.name}")
+
 private sealed interface PrepareAttachmentResult {
     data class Success(
         val prepared: PreparedAttachment,
@@ -123,8 +173,14 @@ data class ChatUiState(
     val chatTitle: String = "Hermes",
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
     val isAgentTyping: Boolean = false,
+    val isMainTurnBusy: Boolean = false,
+    val isSending: Boolean = false,
+    val busySendMode: BusySendMode = BusySendMode.CORRECT,
+    val pendingSends: List<PendingSend> = emptyList(),
     val isThinking: Boolean = false,
     val thinkingText: String = "",
+    /** True while a recorded voice note uploads for server-side transcription. */
+    val isTranscribingVoiceNote: Boolean = false,
     val isLoading: Boolean = false,
     val isLoadingOlder: Boolean = false,
     val hasOlderMessages: Boolean = false,
@@ -137,6 +193,10 @@ data class ChatUiState(
     /** Standalone streaming message — rendered after the main list. */
     val streamingMessage: ChatMessage? = null,
     val errorMessage: String? = null,
+    /** Persistent until dismissed/new turn; distinct from one-shot RPC/network snackbars. */
+    val replyFailure: ReplyFailure? = null,
+    /** Identity of the single non-durable failed assistant projection for this session lifecycle. */
+    val replyFailureProjection: ReplyFailureProjection? = null,
     // Background job completion toast (issue #527) — non-blocking snackbar
     val backgroundCompleteMessage: String? = null,
     // Attachment feedback — surfaced as a non-blocking snackbar (issue #724)
@@ -210,6 +270,8 @@ data class ChatUiState(
     // until the first successful session.usage fetch) — drives the
     // "compressed ×N" badge on the context chip.
     val compressionCount: Int? = null,
+    val isCompressing: Boolean = false,
+    val compressionStatus: String? = null,
     /** Rolling output tokens/sec over the last ~10 calls. */
     val latestTps: Double? = null,
     /** Latest cumulative backend usage snapshot for the current session. */
@@ -241,6 +303,15 @@ data class ChatUiState(
 ) {
     /** Convenience — derived from [connectionStatus]. */
     val isConnected: Boolean get() = connectionStatus == ConnectionStatus.CONNECTED
+
+    /**
+     * True only while a generation can actually be interrupted: typing can
+     * start during session preparation, before any runtime session exists,
+     * and `session.interrupt` has nothing to stop then. The composer derives
+     * its Stop affordance from this instead of [isAgentTyping] alone
+     * (review, PR #1250).
+     */
+    val canInterrupt: Boolean get() = isAgentTyping && isSessionReady
 }
 
 data class ChatTimelineState(
@@ -399,17 +470,44 @@ class ChatViewModel(
     searchDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.Default,
     private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO,
     private val historyDispatcher: kotlinx.coroutines.CoroutineDispatcher = searchDispatcher,
+    private val sendStore: ChatSendStore = ChatSendStore(application),
+    private val voiceNoteRepository: VoiceNoteRepository = VoiceNoteRepository(),
+    internal val onCompressionHistoryReplacedForTest: (() -> Unit)? = null,
 ) : AndroidViewModel(application) {
     constructor(application: Application) : this(application, startCleanup = true)
 
     private val connectionOperationDelegate =
-        ChatConnectionOperationDelegate { method, params ->
-            HermesWsClient.request(method, params).await()
+        ChatConnectionOperationDelegate { action ->
+            when (action) {
+                is ConnectionOperationRequest.Respond -> {
+                    HermesWsClient.call(RpcMethods.CONNECTION_RESPOND, action.params)
+                }
+
+                is ConnectionOperationRequest.Wake -> {
+                    HermesWsClient.call(RpcMethods.CONNECTORS_OPERATION_WAKE, action.params)
+                }
+            }
         }
 
     // ── Internal state ───────────────────────────────────────────────────
     private val _uiState = MutableStateFlow(ChatUiState())
+    private val localTranscriptAppendLock = Any()
+    private var localTranscriptPersistenceTail: Job? = null
+
+    /** Guarded by localTranscriptAppendLock; advanced only after the RPC replacement commits. */
+    private val compressedHistoryEpochs = mutableMapOf<String, Pair<Long, Long>>()
     val connectionOperationState: StateFlow<ConnectionOperationUiState> = connectionOperationDelegate.state
+    private val connectionBrowserReturnTracker = BrowserReturnTracker()
+
+    fun connectionBrowserLaunched(operationId: String) = connectionBrowserReturnTracker.start(operationId)
+
+    fun connectionBrowserLaunchFailed() = connectionBrowserReturnTracker.cancel()
+
+    fun connectionBrowserPaused() = connectionBrowserReturnTracker.onPause()
+
+    fun connectionBrowserReturned(): String? = connectionBrowserReturnTracker.onResume()?.operationId
+
+    fun abandonConnectionBrowser(): Boolean = connectionBrowserReturnTracker.abandon()
 
     private val _streamingState = MutableStateFlow(StreamingState())
 
@@ -421,10 +519,64 @@ class ChatViewModel(
         val resumeSequence: Long = 0L,
         val sessionId: String? = null,
         val connectionCheckpoint: ConnectionResumeCheckpoint? = null,
+        val receiptScope: String? = null,
+        val receiptAttempt: Int? = null,
+    )
+
+    private data class SendOwner(
+        val scope: String,
+        val storageSessionId: String,
+        val agentSessionId: String,
+        val generation: Long,
+    )
+
+    private data class HardInterruptRequest(
+        val messageId: String,
+        val mainTurnEpoch: Long,
+        val owner: SendOwner,
+    )
+
+    private data class PendingSendReservation(
+        val pending: PendingSend,
+        val userMessage: ChatMessage,
+        val wasStreaming: Boolean,
+        val storageSessionId: String,
+        val agentSessionId: String,
+        val scope: String,
+        val generation: Long,
+        val mainTurnEpoch: Long,
+        val originalPending: PendingSend? = null,
+    )
+
+    private data class PendingBranchRequest(
+        val generation: Long,
+        val params: SessionBranchWholeParams,
     )
 
     private val sessionRequestById = ConcurrentHashMap<String, SessionRequest>()
+    private val branchWholeRequests = ConcurrentHashMap<String, PendingBranchRequest>()
+    private val outgoingRequestById = ConcurrentHashMap<String, String>()
+    private val acceptedTurnEpochById = ConcurrentHashMap<String, Long>()
+    private val hardInterruptRequestById = ConcurrentHashMap<String, HardInterruptRequest>()
+    private val queuedStagingIds = ConcurrentHashMap.newKeySet<String>()
+    private val pendingSendReservationLock = Any()
+    private val pendingSendReservations = mutableListOf<PendingSendReservation>()
+    private var pendingSendReservationJob: Job? = null
+    private var queueDrainJob: Job? = null
+    private var mainTurnBusy = false
+        set(busy) {
+            field = busy
+            _uiState.update { state ->
+                if (state.isMainTurnBusy == busy) state else state.copy(isMainTurnBusy = busy)
+            }
+        }
+
+    private var lastMainCompletionAt = 0L
+    private var lastSubmissionKey: String? = null
+    private var lastSubmissionAt = 0L
     private var sessionGeneration = 0L
+    private var mainTurnEpoch = 0L
+    private var lastPendingSendCreatedAt = 0L
 
     private var resumeRequestSequence = 0L
     private var activeResumeRequestSequence = 0L
@@ -442,6 +594,8 @@ class ChatViewModel(
         val attachments: List<Attachment>,
         val wasStreaming: Boolean,
         val userMessage: ChatMessage,
+        val createdAt: Long,
+        val mainTurnEpoch: Long,
     )
 
     private var pendingInitialPrompt: PendingPrompt? = null
@@ -483,6 +637,8 @@ class ChatViewModel(
     private var hydrationJob: Job? = null
     private var olderJob: Job? = null
     private var syncJob: Job? = null
+    private var receiptLookupJob: Job? = null
+    private var receiptLookupCursor = 0L
     private val historyFetchMutex = Mutex()
     private var timelineJob: Job? = null
     private var historyWindowJob: Job? = null
@@ -564,13 +720,13 @@ class ChatViewModel(
             ioDispatcher = ioDispatcher,
             uiState = _uiState,
             runtimeSessionId = { runtimeSessionId },
-            wsSend = { method, params, onSent -> wsClient.send(method, params, onSent) },
+            wsSend = { params, onSent -> wsClient.send(RpcMethods.CONFIG_SET, params, onSent) },
             trackRequest = { id, method -> trackRequest(id, method) },
             addAssistantMessage = { text -> addAssistantMessage(text) },
             handleSlashCommand = { cmd -> handleSlashCommand(cmd) },
             fetchContextUsage = { fetchContextUsage() },
             onModelSwitchInitiated = { onModelSwitchInitiated() },
-            wsRequest = { method, params -> wsClient.request(method, params).await() },
+            wsRequest = { params -> wsClient.call(RpcMethods.CONFIG_SET, params) },
         ).apply {
             attachScopeObserver(viewModelScope)
         }
@@ -591,7 +747,14 @@ class ChatViewModel(
             ioDispatcher = ioDispatcher,
             uiState = _uiState,
             runtimeSessionId = { runtimeSessionId },
-            wsSend = { method, params, onSent -> wsClient.send(method, params, onSent) },
+            rpc =
+                object : TypedRpcSender {
+                    override fun <P> send(
+                        method: RpcMethod<P, *>,
+                        params: P,
+                        onSent: ((String) -> Unit)?,
+                    ): String = wsClient.send(method, params, onSent)
+                },
             trackRequest = { id, method -> trackRequest(id, method) },
             addSystemMessage = { text -> addSystemMessage(text) },
             respondToServerRequest = { id, result -> wsClient.respondToServerRequest(id, result) },
@@ -643,6 +806,33 @@ class ChatViewModel(
             _uiState.value,
         )
 
+    val transcriptState: StateFlow<TranscriptUiState> =
+        combine(uiState, timelineState, streamingState) { chat, timeline, streaming ->
+            TranscriptUiState.resolve(chat, timeline, streaming, savingAttachmentPath = null, speakingMessageId = null)
+        }.stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            TranscriptUiState.resolve(_uiState.value, _timelineState.value, _streamingState.value, null, null),
+        )
+
+    init {
+        // Parse tool payloads off the main thread before the transcript
+        // composes them (issue #1327); ToolBubble then reads a cache hit.
+        viewModelScope.launch(searchDispatcher) {
+            _uiState
+                .map { it.messages }
+                .distinctUntilChanged()
+                .conflate()
+                .collect { messages ->
+                    for (message in messages) {
+                        if (message.role == MessageRole.TOOL) {
+                            ToolViewCache.prewarm(message.content, message.toolName, message.isToolRunning)
+                        }
+                    }
+                }
+        }
+    }
+
     /**
      * Session ID to resume when the WebSocket connects. Set synchronously by
      * [ChatScreen] via `SideEffect` during composition — before any WS event
@@ -676,6 +866,24 @@ class ChatViewModel(
                     status == ConnectionStatus.NO_NETWORK ||
                     status == ConnectionStatus.AUTH_EXPIRED
                 ) {
+                    mainTurnBusy = false
+                    // A gateway acceptance is not a durable REST acknowledgement. Recover even
+                    // receipts whose RPC correlation was already removed, without resending them.
+                    sendStore
+                        .all()
+                        .filter { it.scope == sendScope() && it.state == PendingSendState.ACCEPTED }
+                        .forEach { accepted ->
+                            sendStore.update(accepted.id) { it.copy(requiresExactReconciliation = true) }
+                        }
+                    publishPendingSends()
+                    (outgoingRequestById.values + hardInterruptRequestById.values.map { it.messageId })
+                        .distinct()
+                        .forEach { messageId ->
+                            if (sendStore.all().any { it.id == messageId && it.state == PendingSendState.SENDING }) {
+                                markPendingSend(messageId, PendingSendState.UNKNOWN)
+                                removeUnconfirmedBubble(messageId)
+                            }
+                        }
                     _uiState.update { it.copy(isLoading = false) }
                     subagentsDelegate.closeSubagentTranscript()
                     // The runtime session id is only valid while the socket
@@ -691,6 +899,8 @@ class ChatViewModel(
                     activeHydrationRequestSequence = ++hydrationRequestSequence
                     // Preserve metadata so late results and errors are rejected as stale.
                     sessionGeneration++
+                    queueDrainJob?.cancel()
+                    queueDrainJob = null
                     // #129: invalidate and cancel paged work together, including its busy flags.
                     hydrationJob?.cancel()
                     olderJob?.cancel()
@@ -842,11 +1052,43 @@ class ChatViewModel(
     }
 
     private fun handleWsEvent(event: WsEvent) {
-        // RpcError is reduced before ViewModel request handling. Drop stale
-        // session errors here so the shared reducer cannot clear loading or
-        // surface an error for a newly selected session.
+        // Filter explicitly scoped terminal/start events before buffer resets and reduction.
+        // Legacy unscoped failures are ambiguous across sessions, so fail closed: gateways
+        // must include session_id for failed replies to be surfaced by this client.
+        val turnSessionId =
+            when (event) {
+                is WsEvent.MessageStart -> event.sessionId
+                is WsEvent.MessageComplete -> event.sessionId
+                is WsEvent.MessageDone -> event.sessionId
+                else -> null
+            }
+        if (turnSessionId != null && !isCurrentSession(turnSessionId)) return
+        if (event is WsEvent.MessageComplete &&
+            event.rawPayload?.get("status") == "error" &&
+            event.sessionId == null
+        ) {
+            return
+        }
+
+        // Guard both response types before reduction or any receipt/stream effects.
+        val responseId =
+            when (event) {
+                is WsEvent.RpcResult -> event.id
+                is WsEvent.RpcError -> event.id
+                else -> null
+            }
+        if (responseId != null &&
+            (!ownsTrackedResponseReceipt(responseId) || hasAcceptedTrackedResponseReceipt(responseId))
+        ) {
+            outgoingRequestById.remove(responseId)
+            hardInterruptRequestById.remove(responseId)
+            forgetRequest(responseId)
+            return
+        }
+        // RpcError is reduced before ViewModel request handling. A stale
+        // session error may settle its own receipt but must not touch this UI.
         if (event is WsEvent.RpcError && isStaleSessionRequest(event.id)) {
-            forgetRequest(event.id)
+            handleRpcError(event.id, event.error)
             return
         }
 
@@ -866,13 +1108,7 @@ class ChatViewModel(
             is WsEvent.MessageDone,
             is WsEvent.ToolStart,
             -> {
-                streamingController.flushPendingReasoning()
-                // Issue #842: the token buffer can hold deltas that landed
-                // <33ms before the transition. The reducer seals the
-                // streaming message into the orphan at tool.start — flush
-                // first so the seal carries the COMPLETE narration (a
-                // truncated seal fails the later REST dedupe and ghosts).
-                streamingController.flushPendingTokens()
+                streamingController.flushPendingTransition()
             }
 
             else -> {}
@@ -909,18 +1145,28 @@ class ChatViewModel(
             }
 
             is WsEvent.MessageToken -> {
+                // The interrupted partial is already sealed. Wait for its authoritative
+                // completion instead of letting trailing deltas create a second stream.
+                if (_streamingState.value.interruptedMessage != null && isCurrentSession(event.sessionId)) return
+                if (isCurrentSession(event.sessionId)) mainTurnBusy = true
                 streamingController.handleMessageToken(event)
             }
 
             is WsEvent.ThinkingDelta -> {
+                if (isCurrentSession(event.sessionId)) mainTurnBusy = true
                 streamingController.handleThinkingDelta(event)
             }
 
             is WsEvent.ReasoningDelta -> {
+                if (isCurrentSession(event.sessionId)) mainTurnBusy = true
                 streamingController.handleReasoningDelta(event)
             }
 
             is WsEvent.MessageStart -> {
+                if (isCurrentSession(event.sessionId)) {
+                    mainTurnEpoch++
+                    mainTurnBusy = true
+                }
                 // The server accepted a prompt for this session — its DB row
                 // now exists (created lazily at prompt.submit), so a reconnect
                 // resume will succeed.
@@ -929,15 +1175,27 @@ class ChatViewModel(
             }
 
             is WsEvent.MessageComplete -> {
+                if (isCurrentSession(event.sessionId)) {
+                    mainTurnBusy = false
+                    lastMainCompletionAt = System.currentTimeMillis()
+                    retireReceiptForPersistedTurn(parsePersistedTurn(event.rawPayload))
+                    refreshSendReceipts()
+                }
                 // Buffers cleared before reduce; ViewModel resets them after
                 streamingController.resetStreaming()
             }
 
             is WsEvent.MessageDone -> {
+                if (isCurrentSession(event.sessionId)) {
+                    mainTurnBusy = false
+                    lastMainCompletionAt = System.currentTimeMillis()
+                    refreshSendReceipts()
+                }
                 streamingController.resetStreaming()
             }
 
             is WsEvent.ToolStart -> {
+                if (isCurrentSession(event.sessionId)) mainTurnBusy = true
                 // Issue #771: the reducer keeps the streaming message (and its
                 // reasoning) alive across the tool call so the finalized answer
                 // retains the thinking card. Only the token buffers are cleared
@@ -956,6 +1214,10 @@ class ChatViewModel(
 
             is WsEvent.SessionUpdated -> {
                 loadSessions()
+            }
+
+            is WsEvent.SessionReclaimed -> {
+                handleSessionReclaimed(event)
             }
 
             is WsEvent.TranscriptResyncRequired -> {
@@ -1238,10 +1500,13 @@ class ChatViewModel(
 
     // ── Message streaming ────────────────────────────────────────────────
 
-    /**
-     * Checks if an incoming WS event belongs to the currently active
-     * session. Returns true if the event should be processed.
-     */
+    fun dismissReplyFailure(id: String) {
+        _uiState.update { state ->
+            if (state.replyFailure?.id == id) state.copy(replyFailure = null) else state
+        }
+    }
+
+    /** Checks if an incoming WS event belongs to the currently active session. */
     private fun isCurrentSession(eventSessionId: String?): Boolean {
         // If the event has no session ID, process it (legacy compatibility)
         if (eventSessionId == null) return true
@@ -1275,6 +1540,10 @@ class ChatViewModel(
                     viewModelScope.launch { fetchContextUsage() }
                 }
 
+                is ReducerEffect.DeleteLocalMessage -> {
+                    viewModelScope.launch(ioDispatcher) { repo.deleteMessage(effect.messageId) }
+                }
+
                 is ReducerEffect.AttachHostMedia -> {
                     // Issue #724: turn host-path MEDIA: directives into real
                     // attachments (images inline, every other file tappable)
@@ -1303,6 +1572,7 @@ class ChatViewModel(
         // Session info pushed by backend when config changes
         // (model switch, reasoning level, etc.)
         if (info != null) {
+            (info["running"] as? Boolean)?.let { mainTurnBusy = it }
             val model = info["model"] as? String
             val provider = info["provider"] as? String
             val reasoningEffort = info["reasoning_effort"] as? String
@@ -1373,7 +1643,8 @@ class ChatViewModel(
                 // it. Wait for the RPC's live context_max instead; the
                 // chip stays hidden until the real window lands.
                 viewModelScope.launch { fetchContextUsage(skipRestFallback = true) }
-            } else if ((initialHydration || meterEmpty) && newModelLabel != null &&
+            } else if ((initialHydration || meterEmpty) &&
+                newModelLabel != null &&
                 contextUsageJob?.isActive != true
             ) {
                 viewModelScope.launch { fetchContextUsage() }
@@ -1387,19 +1658,247 @@ class ChatViewModel(
                     runtimeSessionId ?: _uiState.value.currentSessionId,
                 )
             }
+            // Session.info can carry "pending_clarify" the same way — restore
+            // the clarify bubble so a question asked while detached stays
+            // answerable after leaving and re-entering the chat.
+            val pendingClarify = info["pending_clarify"] as? Map<*, *>
+            if (pendingClarify != null) {
+                surfacePendingClarify(
+                    pendingClarify,
+                    runtimeSessionId ?: _uiState.value.currentSessionId,
+                )
+            }
+        }
+    }
+
+    /**
+     * Restore a pending clarify from the "pending_clarify" replay payload that
+     * "session.resume" / "session.info" carry while a clarify blocks the turn
+     * server-side (gateway _live_session_payload). Without this, leaving and
+     * re-entering a chat shows the "waiting for input" status with no way to
+     * answer: the live "clarify.request" event only reached whatever client
+     * was attached when the agent asked.
+     *
+     * The payload has the same shape as a live "clarify.request" event (batch
+     * "questions" or legacy "question"/"choices", plus the "request_id" the
+     * answer must reference), so reuse [EventParser] and feed the typed event
+     * through [handleWsEvent] — the exact path a live question takes. Batch
+     * replays may also carry locked per-question "answers".
+     */
+    private fun surfacePendingClarify(
+        payload: Map<*, *>,
+        sessionId: String?,
+    ) {
+        val clarifyId = (payload["clarify_id"] ?: payload["request_id"]) as? String
+        if (clarifyId != null && _uiState.value.clarifyRequest?.clarifyId == clarifyId) {
+            // Already on screen — avoid clobbering in-progress answer state.
+            return
+        }
+        val clarifyPayload: Map<String, Any?> = payload.entries.associate { (k, v) -> k.toString() to v }
+        val event =
+            EventParser.parseParams(
+                mapOf(
+                    "type" to "clarify.request",
+                    "session_id" to sessionId,
+                    "payload" to clarifyPayload,
+                ),
+            ) as? WsEvent.ClarifyRequest ?: return
+        if (event.questions.isEmpty() && event.text.isNullOrBlank() && event.options.isNullOrEmpty()) {
+            return
+        }
+        // "answers" is replay-only (locked batch answers); mirror it into the
+        // event so restored questions render their answered state.
+        val lockedAnswers =
+            (clarifyPayload["answers"] as? Map<*, *>)
+                ?.mapNotNull { (qid, answer) ->
+                    val id = qid as? String ?: return@mapNotNull null
+                    val text = answer as? String ?: return@mapNotNull null
+                    id to text
+                }?.toMap()
+                ?: emptyMap()
+        handleWsEvent(event.copy(lockedAnswers = lockedAnswers))
+    }
+
+    private fun restoreResumeClarifyRequest(
+        result: Map<String, Any?>,
+        runtimeId: String,
+    ) {
+        // RpcChannel replays open requests before the resume result binds the runtime ID.
+        // A distinct stored ID makes the reducer reject that early replay. Retry only the
+        // validated resume snapshot, without replacing a prompt already accepted live.
+        if (_uiState.value.clarifyRequest != null) return
+        val openRequests = result["open_requests"] as? List<*> ?: return
+        for (item in openRequests) {
+            val replay = item as? Map<*, *> ?: continue
+            if (replay["method"] != "clarify") continue
+            val id = (replay["id"] as? String)?.takeIf { it.isNotBlank() } ?: continue
+
+            @Suppress("UNCHECKED_CAST")
+            val params = replay["params"] as? Map<String, Any?> ?: continue
+            if (params["session_id"] != runtimeId) continue
+            handleServerRequest(WsEvent.ServerRequest(id, "clarify", params, replayed = true))
+            if (_uiState.value.clarifyRequest != null) return
         }
     }
 
     // ── RPC response handling ────────────────────────────────────────────
+
+    private fun isAcceptedOutgoingStatus(
+        method: String,
+        status: String?,
+    ): Boolean =
+        when (method) {
+            WsMethods.SESSION_REDIRECT -> status == "redirected" || status == "queued"
+            WsMethods.SESSION_STEER -> status == "queued" || status == "steered"
+            WsMethods.PROMPT_SUBMIT -> status in setOf("streaming", "queued", "redirected", "steered")
+            else -> false
+        }
+
+    /** A stale UI generation does not invalidate an exact ACK for its original receipt. */
+    private fun ownsOutgoingReceipt(
+        request: SessionRequest,
+        messageId: String,
+    ): Boolean =
+        sendStore.all().any {
+            it.id == messageId && it.scope == request.receiptScope &&
+                it.sessionId == request.sessionId && it.attempts == request.receiptAttempt
+        }
+
+    private fun ownsTrackedResponseReceipt(id: String): Boolean {
+        val messageId = outgoingRequestById[id] ?: hardInterruptRequestById[id]?.messageId ?: return true
+        val request = sessionRequestById[id] ?: return false
+        return ownsOutgoingReceipt(request, messageId)
+    }
+
+    private fun hasAcceptedTrackedResponseReceipt(id: String): Boolean {
+        val messageId = outgoingRequestById[id] ?: hardInterruptRequestById[id]?.messageId ?: return false
+        return sendStore.all().any { it.id == messageId && it.state == PendingSendState.ACCEPTED }
+    }
+
+    private fun settleStaleOutgoingResult(
+        requestId: String,
+        method: String,
+        result: Any?,
+        request: SessionRequest,
+    ) {
+        val messageId = outgoingRequestById.remove(requestId) ?: return
+        val receipt = sendStore.all().firstOrNull { it.id == messageId } ?: return
+        if (receipt.scope != request.receiptScope || receipt.sessionId != request.sessionId ||
+            receipt.attempts != request.receiptAttempt
+        ) {
+            return
+        }
+        val resultMap = rpcResultMap(result)
+        if (!isAcceptedOutgoingStatus(method, resultMap?.get("status") as? String)) {
+            if (receipt.state == PendingSendState.SENDING) markPendingSend(messageId, PendingSendState.UNKNOWN)
+            return
+        }
+        sendStore.update(messageId) {
+            it.copy(
+                state = PendingSendState.ACCEPTED,
+                userRowId = positiveRowId(resultMap?.get("user_row_id")) ?: it.userRowId,
+                requiresExactReconciliation = true,
+            )
+        }
+        publishPendingSends()
+        if (receipt.sessionId == _uiState.value.currentSessionId) drainPendingQueue()
+    }
+
+    private fun settleOutgoingResult(
+        requestId: String,
+        method: String,
+        result: Any?,
+    ) {
+        val messageId = outgoingRequestById.remove(requestId) ?: return
+        val resultMap = rpcResultMap(result)
+        val status = resultMap?.get("status") as? String
+        val accepted = isAcceptedOutgoingStatus(method, status)
+        when {
+            accepted -> {
+                // #1427: a gateway-queued prompt belongs to a future turn, not the
+                // completion currently on screen. Keep it live until that turn is verified.
+                val receipt = sendStore.all().firstOrNull { it.id == messageId }
+                acceptedTurnEpochById[messageId] =
+                    if (status == "queued" ||
+                        (!mainTurnBusy && (receipt == null || lastMainCompletionAt < receipt.createdAt))
+                    ) {
+                        mainTurnEpoch + 1
+                    } else {
+                        mainTurnEpoch
+                    }
+                // #1285: the submit ack names the row written for THIS input. Absent = unproven.
+                positiveRowId(resultMap?.get("user_row_id"))?.let { rowId ->
+                    sendStore.update(messageId) { it.copy(userRowId = rowId) }
+                    _uiState.update { state ->
+                        state.copy(
+                            messages =
+                                state.messages.map {
+                                    if (it.id == messageId &&
+                                        it.serverRowId == null
+                                    ) {
+                                        it.copy(serverRowId = rowId)
+                                    } else {
+                                        it
+                                    }
+                                },
+                        )
+                    }
+                }
+                markPendingSend(messageId, PendingSendState.ACCEPTED)
+                if (sendStore.all().any { it.id == messageId && lastMainCompletionAt >= it.createdAt }) {
+                    refreshSendReceipts()
+                }
+            }
+
+            status == "rejected" && method != WsMethods.PROMPT_SUBMIT -> {
+                removeUnconfirmedBubble(messageId)
+                sendStore.update(messageId) { it.copy(mode = BusySendMode.QUEUE, state = PendingSendState.QUEUED) }
+                publishPendingSends()
+                drainPendingQueue()
+            }
+
+            status == "rejected" -> {
+                markPendingSend(messageId, PendingSendState.REJECTED)
+                removeUnconfirmedBubble(messageId)
+            }
+
+            else -> {
+                markPendingSend(messageId, PendingSendState.UNKNOWN)
+                removeUnconfirmedBubble(messageId)
+            }
+        }
+    }
 
     @Suppress("UNCHECKED_CAST")
     private fun handleRpcResult(
         id: String,
         result: Any?,
     ) {
+        if (!ownsTrackedResponseReceipt(id)) {
+            outgoingRequestById.remove(id)
+            hardInterruptRequestById.remove(id)
+            forgetRequest(id)
+            return
+        }
         val method = idToMethod.remove(id) ?: return
         val request = sessionRequestById.remove(id)
-        if (request != null && isStaleSessionRequest(request)) return
+        branchWholeRequests.remove(id)
+        if (request != null && isStaleSessionRequest(request)) {
+            settleStaleOutgoingResult(id, method, result, request)
+            hardInterruptRequestById.remove(id)?.let { tracked ->
+                val receipt = sendStore.all().firstOrNull { it.id == tracked.messageId }
+                if (receipt?.state == PendingSendState.SENDING) {
+                    markPendingSend(tracked.messageId, PendingSendState.UNKNOWN)
+                }
+            }
+            return
+        }
+        if (method == WsMethods.PROMPT_SUBMIT ||
+            method == WsMethods.SESSION_REDIRECT ||
+            method == WsMethods.SESSION_STEER
+        ) {
+            settleOutgoingResult(id, method, result)
+        }
         when (method) {
             WsMethods.SESSION_CREATE -> {
                 val resultMap = result as? Map<String, Any?>
@@ -1429,8 +1928,11 @@ class ChatViewModel(
                         contextBreakdown = null,
                         compressionCount = null,
                         sessionUsage = null,
+                        isCompressing = false,
+                        compressionStatus = null,
                     )
                 }
+                publishPendingSends()
                 // A gone-session recovery just landed — announce it now that
                 // the message list has been reset by the create.
                 if (pendingGoneSessionNotice) {
@@ -1450,18 +1952,34 @@ class ChatViewModel(
                 val pending = pendingInitialPrompt
                 pendingInitialPrompt = null
                 if (pending != null) {
-                    dispatchPrompt(
-                        text = pending.text,
-                        attachments = pending.attachments,
-                        wasStreaming = pending.wasStreaming,
-                        storageSessionId = storageId,
-                        agentSessionId = runtimeId,
-                        userMessage = pending.userMessage,
+                    enqueuePendingSendReservation(
+                        PendingSendReservation(
+                            pending =
+                                PendingSend(
+                                    id = pending.userMessage.id,
+                                    scope = sendScope(),
+                                    sessionId = storageId,
+                                    text = pending.text,
+                                    attachments = pending.attachments,
+                                    mode = BusySendMode.CORRECT,
+                                    state = PendingSendState.SENDING,
+                                    createdAt = pending.createdAt,
+                                ),
+                            userMessage = pending.userMessage,
+                            wasStreaming = pending.wasStreaming,
+                            storageSessionId = storageId,
+                            agentSessionId = runtimeId,
+                            scope = sendScope(),
+                            generation = sessionGeneration,
+                            mainTurnEpoch = pending.mainTurnEpoch,
+                        ),
                     )
                 }
             }
 
-            WsMethods.SESSION_BRANCH -> {
+            WsMethods.SESSION_BRANCH,
+            WsMethods.SESSION_BRANCH_WHOLE,
+            -> {
                 val resultMap = result as? Map<String, Any?> ?: return
                 // The result carries BOTH ids: `session_id` is the runtime
                 // registry id, `stored_session_id` is the DB key. currentSessionId
@@ -1510,20 +2028,24 @@ class ChatViewModel(
 
             WsMethods.SESSION_RESUME -> {
                 val resultMap = result as? Map<String, Any?>
+                // A resume response may carry retained terminal state. Correlate the
+                // exact request and stored session before binding the runtime id or
+                // projecting any failure; a late response must not touch the new chat.
+                val resumeRequest = request ?: return
+                val sessionId = resumeRequest.sessionId ?: return
+                if (sessionId != _uiState.value.currentSessionId) return
+                val resumedStoredId = (resultMap?.get("resumed") as? String)?.takeIf { it.isNotBlank() }
+                if (resumedStoredId != null && resumedStoredId != sessionId) return
                 val runtimeId = (resultMap?.get("session_id") as? String)?.takeIf { it.isNotBlank() }
                 if (runtimeId == null) {
-                    val sessionId = request?.sessionId ?: _uiState.value.currentSessionId ?: return
-                    handleResumeFailure(sessionId, sessionGeneration, "Invalid session resume response")
+                    handleResumeFailure(sessionId, resumeRequest.generation, "Invalid session resume response")
                     return
                 }
                 runtimeSessionId = runtimeId
                 connectionOperationDelegate.bindSession(runtimeId)
+                mainTurnBusy = resultMap["running"] as? Boolean ?: false
                 // Resume succeeded — the gateway confirmed the DB row.
                 sessionHasServerPresence = true
-                val sessionId =
-                    request?.sessionId
-                        ?: (resultMap["resumed"] as? String)
-                        ?: _uiState.value.currentSessionId
 
                 // Parse session info from backend — model, provider, reasoning_effort
                 val infoMap = resultMap["info"] as? Map<String, Any?>
@@ -1592,9 +2114,11 @@ class ChatViewModel(
                 ActiveSessionHolder.set(runtimeSessionId ?: sessionId, sessionId)
                 addSystemMessage("Session resumed")
                 fetchContextUsage()
-                val generation = request?.generation ?: sessionGeneration
+                projectRetainedReplyFailure(resultMap["inflight"] as? Map<String, Any?>, runtimeId)
+                val generation = resumeRequest.generation
                 resumedGeneration = generation
                 finishResumeWhenHydrated(generation)
+                publishPendingSends()
                 subagentsDelegate.hydrateSubagents(runtimeSessionId ?: sessionId)
                 // Reconnect replay: resume payload can carry `pending_approval`
                 // (server `_session_info_payload`); surface it, then ask for
@@ -1606,6 +2130,18 @@ class ChatViewModel(
                         runtimeSessionId ?: sessionId,
                     )
                 }
+                // Reconnect replay: resume payload can carry "pending_clarify"
+                // (server _live_session_payload) — restore the clarify bubble
+                // so questions asked while the client was detached remain
+                // answerable after leaving and re-entering the session.
+                val pendingClarify = resultMap["pending_clarify"] as? Map<*, *>
+                if (pendingClarify != null) {
+                    surfacePendingClarify(
+                        pendingClarify,
+                        runtimeSessionId ?: sessionId,
+                    )
+                }
+                restoreResumeClarifyRequest(resultMap, runtimeId)
                 val activeSessionId = runtimeSessionId ?: sessionId
                 // Reconnect replay: the backend-owned connector operation is
                 // authoritative and uses the same full snapshot as the live
@@ -1621,20 +2157,84 @@ class ChatViewModel(
             }
 
             WsMethods.SESSION_INTERRUPT -> {
-                // Issue #842 follow-up: seal whatever the agent streamed so far
-                // (interim commentary + partial answer) BEFORE clearing the
-                // streaming state. The old tool.start orphan seal used to leave
-                // pre-tool text behind on interrupt; with that seal gone, the
-                // partial would otherwise vanish entirely.
-                sealStreamingMessageIfAny()
-                _uiState.update {
-                    it.copy(
-                        isAgentTyping = false,
-                    )
+                val hardInterrupt = hardInterruptRequestById.remove(id)
+                val status = rpcResultMap(result)?.get("status")
+                val targetsCurrentTurn = hardInterrupt == null || hardInterrupt.mainTurnEpoch == mainTurnEpoch
+                if (targetsCurrentTurn && status in setOf("interrupted", "not_interrupted")) {
+                    // Never let a late result for an older same-session turn
+                    // erase a newer stream or make its replacement race it.
+                    streamingController.flushPendingTransition()
+                    val interruptedStream = _streamingState.value
+                    sealStreamingMessageIfAny()
+                    val interruptedMessage =
+                        interruptedStream.streamingMessage?.let { stream ->
+                            _uiState.value.messages.firstOrNull { it.id == stream.id }
+                        }
+                    _uiState.update { it.copy(isAgentTyping = false) }
+                    _streamingState.update {
+                        interruptedStream.copy(
+                            streamingMessage = null,
+                            interruptedMessage = interruptedMessage,
+                            isThinking = false,
+                            thinkingText = "",
+                            isReasoning = false,
+                        )
+                    }
+                    streamingController.resetStreaming()
+                    if (status == "interrupted") addSystemMessage("Session interrupted")
+                    mainTurnBusy = false
                 }
-                _streamingState.update { StreamingState() }
-                streamingController.resetStreaming()
-                addSystemMessage("Session interrupted")
+                hardInterrupt?.let { tracked ->
+                    val messageId = tracked.messageId
+                    val row = sendStore.all().firstOrNull { it.id == messageId } ?: return@let
+                    when {
+                        !targetsCurrentTurn && status in setOf("interrupted", "not_interrupted") -> {
+                            // The replacement is known unsent, but this successful interrupt
+                            // result belongs to an older turn. Wait behind the newer turn.
+                            sendStore.update(messageId) {
+                                it.copy(state = PendingSendState.QUEUED, mode = BusySendMode.QUEUE)
+                            }
+                            publishPendingSends()
+                        }
+
+                        status == "interrupted" -> {
+                            val message =
+                                _uiState.value.messages.firstOrNull { it.id == row.id }
+                                    ?: ChatMessage(
+                                        id = row.id,
+                                        role = MessageRole.USER,
+                                        content = row.text,
+                                        attachments = row.attachments,
+                                    )
+                            dispatchPrompt(
+                                text = row.text,
+                                attachments = row.attachments,
+                                wasStreaming = false,
+                                storageSessionId = row.sessionId,
+                                agentSessionId = tracked.owner.agentSessionId,
+                                userMessage = message,
+                                mode = BusySendMode.INTERRUPT,
+                                queued = true,
+                                owner = tracked.owner,
+                                pendingReceipt = row,
+                                outboundAlreadyStarted = true,
+                            )
+                        }
+
+                        status == "not_interrupted" -> {
+                            sendStore.update(messageId) {
+                                it.copy(state = PendingSendState.QUEUED, mode = BusySendMode.QUEUE)
+                            }
+                            publishPendingSends()
+                            drainPendingQueue()
+                        }
+
+                        else -> {
+                            markPendingSend(messageId, PendingSendState.UNKNOWN)
+                            removeUnconfirmedBubble(messageId)
+                        }
+                    }
+                }
             }
 
             WsMethods.COMMANDS_CATALOG -> {
@@ -1661,6 +2261,25 @@ class ChatViewModel(
                 modelSwitchDelegate.handleConfigSetResult(id, result)
             }
         }
+    }
+
+    /**
+     * Replays a gateway-retained failed turn through the same reducer path as a
+     * live terminal `message.complete(status=error)`. The assistant field is
+     * the partial display projection; user/transcript fields are never exported
+     * as diagnostics, and reducer effects intentionally do not persist it.
+     */
+    private fun projectRetainedReplyFailure(
+        inflight: Map<String, Any?>?,
+        runtimeId: String,
+    ) {
+        if (inflight?.get("status") != "error") return
+        val result =
+            ChatWsEventReducer.reduceRetainedReplyFailure(_uiState.value, inflight, runtimeId)
+        _uiState.value = result.state
+        _streamingState.value = result.streamingState
+        dispatchReducerEffects(result.effects)
+        streamingController.resetStreaming()
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -1710,21 +2329,67 @@ class ChatViewModel(
         id: String,
         error: Any?,
     ) {
+        if (!ownsTrackedResponseReceipt(id) || hasAcceptedTrackedResponseReceipt(id)) {
+            outgoingRequestById.remove(id)
+            hardInterruptRequestById.remove(id)
+            forgetRequest(id)
+            return
+        }
         val method = idToMethod.remove(id) ?: return
         val request = sessionRequestById.remove(id)
-        if (request != null && isStaleSessionRequest(request)) return
+        val pendingBranch = branchWholeRequests.remove(id)
+        if (request != null && isStaleSessionRequest(request)) {
+            outgoingRequestById.remove(id)?.let { messageId ->
+                if (ownsOutgoingReceipt(request, messageId) &&
+                    sendStore.all().any { it.id == messageId && it.state == PendingSendState.SENDING }
+                ) {
+                    markPendingSend(messageId, PendingSendState.UNKNOWN)
+                }
+            }
+            hardInterruptRequestById.remove(id)?.let { tracked ->
+                val receipt = sendStore.all().firstOrNull { it.id == tracked.messageId }
+                if (request != null && ownsOutgoingReceipt(request, tracked.messageId) &&
+                    receipt?.state == PendingSendState.SENDING
+                ) {
+                    markPendingSend(tracked.messageId, PendingSendState.UNKNOWN)
+                }
+            }
+            return
+        }
         val errorMsg =
             when (error) {
                 is Map<*, *> -> error["message"] as? String ?: error.toString()
                 else -> error.toString()
             }
 
-        if (method == WsMethods.PROMPT_SUBMIT || method == WsMethods.SESSION_REDIRECT) {
+        val messageId = outgoingRequestById.remove(id)
+        if (messageId != null) {
+            val code = (error as? JsonRpcError)?.code
+            val correction = method == WsMethods.SESSION_REDIRECT || method == WsMethods.SESSION_STEER
+            if (correction && code in setOf(4001, 4009, 4010)) {
+                removeUnconfirmedBubble(messageId)
+                sendStore.update(messageId) { it.copy(mode = BusySendMode.QUEUE, state = PendingSendState.QUEUED) }
+                publishPendingSends()
+                drainPendingQueue()
+            } else {
+                markPendingSend(
+                    messageId,
+                    if (code != null && code in 4000..4999) PendingSendState.REJECTED else PendingSendState.UNKNOWN,
+                )
+                removeUnconfirmedBubble(messageId)
+            }
+        }
+        hardInterruptRequestById.remove(id)?.let { tracked ->
+            markPendingSend(tracked.messageId, PendingSendState.UNKNOWN)
+            removeUnconfirmedBubble(tracked.messageId)
+        }
+
+        if (method == WsMethods.PROMPT_SUBMIT && !mainTurnBusy) {
             // A prompt rejection can arrive before message.start, leaving the
             // UI with only the optimistic typing state. Clear the live tail so
             // a failed generation cannot leave stale dots or reasoning behind.
             sealStreamingMessageIfAny()
-            _uiState.update { it.copy(isAgentTyping = false) }
+            _uiState.update { it.copy(isAgentTyping = mainTurnBusy) }
             _streamingState.update { StreamingState() }
             streamingController.resetStreaming()
         }
@@ -1751,13 +2416,37 @@ class ChatViewModel(
         if (method == WsMethods.SESSION_CREATE) {
             val pending = pendingInitialPrompt
             pendingInitialPrompt = null
+            publishPendingSends()
             if (pending != null) {
                 _uiState.update {
                     it.copy(
+                        messages = it.messages.filterNot { message -> message.id == pending.userMessage.id },
+                        pendingAttachments = pending.attachments + it.pendingAttachments,
+                        composerTextToRestore = pending.text,
                         isAgentTyping = false,
                         errorMessage = "Failed to create session: $errorMsg",
                     )
                 }
+            }
+        }
+
+        if (method == WsMethods.SESSION_BRANCH_WHOLE) {
+            val code =
+                (error as? JsonRpcError)?.code
+                    ?: (error as? Map<*, *>)?.get("code") as? Int
+            if (code == -32601 && pendingBranch != null && pendingBranch.generation == sessionGeneration) {
+                val p = pendingBranch.params
+                val generation = pendingBranch.generation
+                viewModelScope.launch(ioDispatcher) {
+                    wsClient.send(
+                        RpcMethods.SESSION_BRANCH,
+                        SessionBranchParams(sessionId = p.sessionId, name = p.name),
+                        onSent = { branchId ->
+                            trackSessionRequest(branchId, WsMethods.SESSION_BRANCH, generation)
+                        },
+                    )
+                }
+                return
             }
         }
 
@@ -1775,6 +2464,737 @@ class ChatViewModel(
 
     // ── Send message ─────────────────────────────────────────────────────
 
+    /** Authenticated gateway URL for a host `MEDIA:` path; kept out of the pure mapper (#1337). */
+    private fun gatewayMediaUrl(path: String): String? =
+        GatewayFileClient.buildMediaUrl(AuthManager.getBaseUrl(), AuthManager.getToken().orEmpty(), path)
+
+    private fun sendScope(): String =
+        listOf(
+            AuthManager.getBaseUrl(),
+            AuthManager.getSelectedProfileId() ?: AuthManager.DEFAULT_PROFILE_ID,
+            AuthManager.activeProfileId.value ?: AuthManager.DEFAULT_PROFILE_ID,
+        ).joinToString("\u001f")
+
+    private fun isCurrentSendContext(
+        scope: String,
+        storageSessionId: String,
+        agentSessionId: String,
+        generation: Long,
+    ): Boolean =
+        generation == sessionGeneration &&
+            scope == sendScope() &&
+            storageSessionId == _uiState.value.currentSessionId &&
+            agentSessionId == runtimeSessionId
+
+    private fun isCurrentSendContext(owner: SendOwner): Boolean =
+        isCurrentSendContext(
+            owner.scope,
+            owner.storageSessionId,
+            owner.agentSessionId,
+            owner.generation,
+        )
+
+    private fun captureSendOwner(
+        storageSessionId: String,
+        agentSessionId: String,
+        scope: String = sendScope(),
+        generation: Long = sessionGeneration,
+    ): SendOwner = SendOwner(scope, storageSessionId, agentSessionId, generation)
+
+    /** Context invalidation and synchronous WS enqueue are serialized on Main. */
+    private suspend fun <T> withCurrentSendOwner(
+        owner: SendOwner,
+        action: () -> T,
+    ): T? =
+        withContext(Dispatchers.Main.immediate) {
+            if (isCurrentSendContext(owner)) action() else null
+        }
+
+    private fun restoreKnownUnsentReceipt(
+        attempted: PendingSend,
+        rollback: PendingSend?,
+        deleteSnapshot: Boolean,
+    ) {
+        if (rollback != null) sendStore.put(rollback) else sendStore.remove(attempted.id)
+        publishPendingSends()
+        if (deleteSnapshot && rollback?.attachments.orEmpty().none { it.uri.startsWith("file:", ignoreCase = true) }) {
+            viewModelScope.launch(ioDispatcher) { deleteQueuedAttachmentSnapshot(attempted.id) }
+        }
+    }
+
+    /** Commit/claim and enqueue the first RPC without releasing Main ownership. */
+    private suspend fun <T> commitReceiptAndEnqueue(
+        owner: SendOwner,
+        attempted: PendingSend,
+        rollback: PendingSend?,
+        deleteSnapshotOnRollback: Boolean,
+        enqueue: () -> T,
+    ): T? =
+        withContext(Dispatchers.Main.immediate) {
+            if (!isCurrentSendContext(owner)) {
+                restoreKnownUnsentReceipt(attempted, rollback, deleteSnapshotOnRollback)
+                return@withContext null
+            }
+            sendStore.put(attempted)
+            publishPendingSends()
+            // Store callbacks can re-enter profile selection.
+            if (!isCurrentSendContext(owner)) {
+                restoreKnownUnsentReceipt(attempted, rollback, deleteSnapshotOnRollback)
+                return@withContext null
+            }
+            enqueue()
+        }
+
+    private fun deleteQueuedAttachmentSnapshot(messageId: String) {
+        File(getApplication<Application>().filesDir, "chat-send/$messageId").deleteRecursively()
+    }
+
+    @Synchronized
+    private fun nextPendingSendCreatedAt(): Long {
+        lastPendingSendCreatedAt = maxOf(System.currentTimeMillis(), lastPendingSendCreatedAt + 1L)
+        return lastPendingSendCreatedAt
+    }
+
+    private fun hasPendingSendReservation(
+        scope: String,
+        sessionId: String?,
+    ): Boolean =
+        synchronized(pendingSendReservationLock) {
+            pendingSendReservations.any { it.scope == scope && it.storageSessionId == sessionId }
+        }
+
+    private fun enqueuePendingSendReservation(reservation: PendingSendReservation) {
+        synchronized(pendingSendReservationLock) { pendingSendReservations += reservation }
+        startPendingSendReservationDrain()
+    }
+
+    @Synchronized
+    private fun startPendingSendReservationDrain() {
+        if (pendingSendReservationJob?.isActive == true) return
+        pendingSendReservationJob =
+            viewModelScope.launch(ioDispatcher) {
+                try {
+                    while (true) {
+                        val reservation =
+                            synchronized(pendingSendReservationLock) { pendingSendReservations.firstOrNull() }
+                                ?: break
+                        try {
+                            processPendingSendReservation(reservation)
+                        } finally {
+                            synchronized(pendingSendReservationLock) {
+                                pendingSendReservations.removeAll { it.pending.id == reservation.pending.id }
+                            }
+                        }
+                    }
+                } finally {
+                    pendingSendReservationJob = null
+                    if (synchronized(pendingSendReservationLock) { pendingSendReservations.isNotEmpty() }) {
+                        startPendingSendReservationDrain()
+                    } else {
+                        drainPendingQueue()
+                    }
+                }
+            }
+    }
+
+    private suspend fun processPendingSendReservation(reservation: PendingSendReservation) {
+        val owner =
+            captureSendOwner(
+                reservation.storageSessionId,
+                reservation.agentSessionId,
+                reservation.scope,
+                reservation.generation,
+            )
+        try {
+            var staged = stageQueuedAttachments(reservation.pending).copy(requiresAttachmentRecovery = false)
+            kotlinx.coroutines.yield()
+            if (withCurrentSendOwner(owner) { true } != true) {
+                if (reservation.originalPending == null) deleteQueuedAttachmentSnapshot(reservation.pending.id)
+                return
+            }
+            if (reservation.wasStreaming &&
+                staged.mode == BusySendMode.INTERRUPT &&
+                reservation.mainTurnEpoch != mainTurnEpoch
+            ) {
+                staged = staged.copy(mode = BusySendMode.QUEUE, state = PendingSendState.QUEUED)
+            }
+            val stagedMessage =
+                reservation.userMessage.copy(
+                    attachments = staged.attachments.takeIf { it.isNotEmpty() },
+                )
+            if (withCurrentSendOwner(owner) {
+                    _uiState.update { state ->
+                        val messages =
+                            if (state.messages.any { it.id == stagedMessage.id }) {
+                                state.messages.map { if (it.id == stagedMessage.id) stagedMessage else it }
+                            } else {
+                                state.messages + stagedMessage
+                            }
+                        state.copy(messages = messages, isSending = true)
+                    }
+                    true
+                } != true
+            ) {
+                if (reservation.originalPending == null) deleteQueuedAttachmentSnapshot(staged.id)
+                return
+            }
+
+            when {
+                staged.state == PendingSendState.QUEUED -> {
+                    val committed =
+                        withContext(Dispatchers.Main.immediate) {
+                            if (!isCurrentSendContext(owner)) return@withContext false
+                            sendStore.put(staged)
+                            publishPendingSends()
+                            if (!isCurrentSendContext(owner)) {
+                                restoreKnownUnsentReceipt(
+                                    staged,
+                                    reservation.originalPending,
+                                    deleteSnapshot = reservation.originalPending != null,
+                                )
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                    if (committed) repo.persistMessage(stagedMessage, owner.storageSessionId)
+                }
+
+                reservation.wasStreaming && staged.mode == BusySendMode.INTERRUPT -> {
+                    commitReceiptAndEnqueue(
+                        owner,
+                        staged,
+                        reservation.originalPending,
+                        deleteSnapshotOnRollback = true,
+                    ) {
+                        wsClient.send(
+                            RpcMethods.SESSION_INTERRUPT,
+                            SessionInterruptParams(owner.agentSessionId),
+                            onSent = { id -> trackHardInterrupt(id, staged.id, owner, reservation.mainTurnEpoch) },
+                        )
+                    }
+                }
+
+                else -> {
+                    dispatchPrompt(
+                        text = staged.text,
+                        attachments = staged.attachments,
+                        wasStreaming = reservation.wasStreaming,
+                        storageSessionId = owner.storageSessionId,
+                        agentSessionId = owner.agentSessionId,
+                        userMessage = stagedMessage,
+                        mode = if (reservation.wasStreaming) staged.mode else BusySendMode.CORRECT,
+                        owner = owner,
+                        pendingReceipt = staged,
+                        rollbackReceipt = reservation.originalPending,
+                        deleteSnapshotOnRollback = true,
+                    ).join()
+                }
+            }
+        } catch (e: Exception) {
+            if (reservation.originalPending != null) {
+                sendStore.put(reservation.originalPending)
+            } else {
+                sendStore.remove(reservation.pending.id)
+                deleteQueuedAttachmentSnapshot(reservation.pending.id)
+            }
+            publishPendingSends()
+            if (e is CancellationException) throw e
+            if (withCurrentSendOwner(owner) { true } == true) {
+                if (reservation.originalPending == null) {
+                    _uiState.update { state ->
+                        state.copy(
+                            messages = state.messages.filterNot { it.id == reservation.pending.id },
+                            pendingAttachments = reservation.pending.attachments + state.pendingAttachments,
+                            composerTextToRestore = reservation.pending.text,
+                            errorMessage =
+                                if (e is QueuedAttachmentTooLargeException) {
+                                    attachmentTooLargeMessage(e.attachment)
+                                } else {
+                                    "Could not retain attachment"
+                                },
+                        )
+                    }
+                } else if (e is QueuedAttachmentTooLargeException) {
+                    _uiState.update { it.copy(errorMessage = attachmentTooLargeMessage(e.attachment)) }
+                }
+                publishPendingSends()
+            }
+        }
+    }
+
+    private fun publishPendingSends() {
+        val sessionId = _uiState.value.currentSessionId
+        val scope = sendScope()
+        val current = sendStore.all().filter { it.scope == scope && it.sessionId == sessionId }
+        _uiState.update {
+            it.copy(
+                pendingSends = current,
+                isSending =
+                    pendingInitialPrompt != null || current.any { row -> row.state == PendingSendState.SENDING },
+            )
+        }
+    }
+
+    private fun trackOutgoingRequest(
+        requestId: String,
+        messageId: String,
+        method: String,
+        generation: Long,
+        sessionId: String,
+    ) {
+        outgoingRequestById[requestId] = messageId
+        val receipt = sendStore.all().firstOrNull { it.id == messageId }
+        trackSessionRequest(
+            requestId,
+            method,
+            generation,
+            sessionId = sessionId,
+            receiptScope = receipt?.scope,
+            receiptAttempt = receipt?.attempts,
+        )
+        if (!isTestEnvironment()) {
+            viewModelScope.launch {
+                delay(30_000L)
+                expireOutgoingRequest(requestId)
+            }
+        }
+    }
+
+    internal fun expireOutgoingRequest(requestId: String) {
+        val messageId =
+            outgoingRequestById[requestId]
+                ?: hardInterruptRequestById[requestId]?.messageId
+                ?: return
+        val request = sessionRequestById[requestId] ?: return
+        if (!ownsOutgoingReceipt(request, messageId)) return
+        if (sendStore.all().any { it.id == messageId && it.state == PendingSendState.SENDING }) {
+            markPendingSend(messageId, PendingSendState.UNKNOWN)
+            if (!isStaleSessionRequest(request)) removeUnconfirmedBubble(messageId)
+        }
+    }
+
+    private fun trackHardInterrupt(
+        requestId: String,
+        messageId: String,
+        owner: SendOwner,
+        interruptedTurnEpoch: Long,
+    ) {
+        hardInterruptRequestById[requestId] = HardInterruptRequest(messageId, interruptedTurnEpoch, owner)
+        val receipt = sendStore.all().firstOrNull { it.id == messageId }
+        trackSessionRequest(
+            requestId,
+            WsMethods.SESSION_INTERRUPT,
+            owner.generation,
+            sessionId = owner.storageSessionId,
+            receiptScope = receipt?.scope,
+            receiptAttempt = receipt?.attempts,
+        )
+        if (!isTestEnvironment()) {
+            viewModelScope.launch {
+                delay(30_000L)
+                expireOutgoingRequest(requestId)
+            }
+        }
+    }
+
+    private fun markPendingSend(
+        messageId: String,
+        state: PendingSendState,
+    ) {
+        sendStore.update(messageId) { it.copy(state = state) }
+        if (state != PendingSendState.ACCEPTED) acceptedTurnEpochById.remove(messageId)
+        publishPendingSends()
+        // #1427: settled/uncertain receipts remain recoverable, but cannot freeze later sends.
+        if (state != PendingSendState.SENDING) drainPendingQueue()
+    }
+
+    private fun removePendingSend(messageId: String) {
+        acceptedTurnEpochById.remove(messageId)
+        sendStore.remove(messageId)
+        // #1459: the receipt is settled, but a visible bubble may still load this private file.
+        // Release it only once the transcript no longer references it (see releaseUnreferencedSnapshots).
+        if (!visibleBubbleReferencesSnapshot(messageId)) {
+            viewModelScope.launch(ioDispatcher) { deleteQueuedAttachmentSnapshot(messageId) }
+        }
+        publishPendingSends()
+    }
+
+    private fun visibleBubbleReferencesSnapshot(messageId: String): Boolean =
+        _uiState.value.messages.any { message ->
+            message.id == messageId && message.attachments.orEmpty().any { it.uri.startsWith("file:", true) }
+        }
+
+    /**
+     * Delete staged snapshots that no receipt, reservation or visible bubble can still read. Called after a
+     * history merge, when a confirmed gateway image may have replaced the local file source.
+     */
+    private fun releaseUnreferencedSnapshots() {
+        viewModelScope.launch(ioDispatcher) {
+            // Best-effort housekeeping: never let it disturb the history merge that triggered it.
+            val root = runCatching { File(getApplication<Application>().filesDir, "chat-send") }.getOrNull()
+            val dirs = root?.listFiles { file -> file.isDirectory } ?: return@launch
+            val receipts = sendStore.all().mapTo(mutableSetOf()) { it.id }
+            dirs.forEach { dir ->
+                val id = dir.name
+                val reserved =
+                    synchronized(pendingSendReservationLock) { pendingSendReservations.any { it.pending.id == id } }
+                if (id in receipts || reserved || queuedStagingIds.contains(id)) return@forEach
+                if (withContext(Dispatchers.Main.immediate) { visibleBubbleReferencesSnapshot(id) }) return@forEach
+                dir.deleteRecursively()
+            }
+        }
+    }
+
+    /**
+     * #1285: only a complete receipt proves the whole turn is durable, and only the receipt
+     * already bound to that exact `user_row_id` is retired. Partial or id-less receipts leave
+     * every local row to REST reconciliation; no row is ever inferred from text or position.
+     */
+    private fun retireReceiptForPersistedTurn(turn: PersistedTurn?) {
+        val userRowId = turn?.userRowId?.takeIf { turn.complete } ?: return
+        val sessionId = _uiState.value.currentSessionId ?: return
+        val scope = sendScope()
+        sendStore
+            .all()
+            .filter {
+                it.scope == scope &&
+                    it.sessionId == sessionId &&
+                    it.userRowId == userRowId &&
+                    it.state in setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+            }.forEach { removePendingSend(it.id) }
+    }
+
+    private fun removeUnconfirmedBubble(messageId: String) {
+        val row = _uiState.value.messages.firstOrNull { it.id == messageId && it.canonicalRestId == null } ?: return
+        _uiState.update { state -> state.copy(messages = state.messages.filterNot { it.id == row.id }) }
+        viewModelScope.launch(ioDispatcher) { repo.deleteMessage(row.id) }
+    }
+
+    private fun failOutgoingBeforeSubmit(
+        messageId: String,
+        reason: String,
+        generation: Long = sessionGeneration,
+    ) {
+        markPendingSend(messageId, PendingSendState.REJECTED)
+        if (generation != sessionGeneration) return
+        removeUnconfirmedBubble(messageId)
+        _uiState.update { it.copy(errorMessage = reason, isAgentTyping = mainTurnBusy) }
+    }
+
+    /** #1427: serialize submissions, not durable-history reconciliation; never replay uncertain rows. */
+    @Synchronized
+    private fun drainPendingQueue() {
+        val sessionId = _uiState.value.currentSessionId ?: return
+        val runtimeId = runtimeSessionId ?: return
+        val scope = sendScope()
+        if (mainTurnBusy ||
+            !_uiState.value.isSessionReady ||
+            wsClient.connectionStatus.value != ConnectionStatus.CONNECTED
+        ) {
+            return
+        }
+        if (queueDrainJob?.isActive == true) return
+        if (hasPendingSendReservation(scope, sessionId)) return
+        val rows = sendStore.all().filter { it.scope == scope && it.sessionId == sessionId }
+        if (rows.any { it.state == PendingSendState.SENDING }) {
+            return
+        }
+        val next = rows.firstOrNull { it.state == PendingSendState.QUEUED } ?: return
+        if (queuedStagingIds.contains(next.id)) return
+        val owner = captureSendOwner(sessionId, runtimeId, scope, sessionGeneration)
+        queueDrainJob =
+            viewModelScope.launch(ioDispatcher) {
+                try {
+                    val staged = stageQueuedAttachments(next)
+                    if (withCurrentSendOwner(owner) { true } != true) return@launch
+                    val message =
+                        _uiState.value.messages.firstOrNull { it.id == next.id }
+                            ?: ChatMessage(
+                                id = next.id,
+                                role = MessageRole.USER,
+                                content = next.text,
+                                attachments = staged.attachments,
+                            )
+                    dispatchPrompt(
+                        text = next.text,
+                        attachments = staged.attachments,
+                        wasStreaming = false,
+                        storageSessionId = owner.storageSessionId,
+                        agentSessionId = owner.agentSessionId,
+                        userMessage = message,
+                        mode = BusySendMode.QUEUE,
+                        queued = true,
+                        owner = owner,
+                        pendingReceipt =
+                            staged.copy(
+                                state = PendingSendState.SENDING,
+                                attempts = next.attempts + 1,
+                            ),
+                        rollbackReceipt = next,
+                    ).join()
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    failOutgoingBeforeSubmit(
+                        next.id,
+                        if (e is QueuedAttachmentTooLargeException) {
+                            attachmentTooLargeMessage(e.attachment)
+                        } else {
+                            "Could not retain queued attachment"
+                        },
+                    )
+                } finally {
+                    if (queueDrainJob === currentCoroutineContext()[Job]) {
+                        queueDrainJob = null
+                        // Preparation can restore the same known-unsent row. Leave it for explicit recovery.
+                        val restored = sendStore.all().any { it.id == next.id && it.state == PendingSendState.QUEUED }
+                        if (currentCoroutineContext().isActive && !restored) drainPendingQueue()
+                    }
+                }
+            }
+    }
+
+    private fun stageQueuedAttachments(row: PendingSend): PendingSend {
+        if (row.attachments.isEmpty()) return row
+        val context = getApplication<Application>()
+        val dir = File(context.filesDir, "chat-send/${row.id}")
+        if (!dir.exists() && !dir.mkdirs()) error("Could not create attachment snapshot")
+        val staged =
+            row.attachments.mapIndexed { index, attachment ->
+                val uri = Uri.parse(attachment.uri)
+                val target = File(dir, index.toString())
+                if (target.exists()) {
+                    attachment.copy(uri = Uri.fromFile(target).toString(), size = target.length())
+                } else {
+                    val partial = File(dir, "$index.part")
+                    var copied = 0L
+                    try {
+                        val input = context.contentResolver.openInputStream(uri) ?: error("Attachment unavailable")
+                        input.use { source ->
+                            partial.outputStream().use { output ->
+                                val buffer = ByteArray(8192)
+                                while (true) {
+                                    val count = source.read(buffer)
+                                    if (count < 0) break
+                                    copied += count
+                                    if (copied > MAX_CHAT_ATTACHMENT_BYTES) {
+                                        throw QueuedAttachmentTooLargeException(attachment)
+                                    }
+                                    output.write(buffer, 0, count)
+                                }
+                            }
+                        }
+                        if (!partial.renameTo(target)) error("Could not save attachment snapshot")
+                        attachment.copy(uri = Uri.fromFile(target).toString(), size = copied)
+                    } catch (e: Exception) {
+                        partial.delete()
+                        throw e
+                    }
+                }
+            }
+        return row.copy(attachments = staged)
+    }
+
+    private fun refreshSendReceipts() {
+        val sessionId = _uiState.value.currentSessionId ?: return
+        if (sendStore.all().any {
+                it.scope == sendScope() &&
+                    it.sessionId == sessionId &&
+                    it.state in setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+            }
+        ) {
+            if (sessionHasServerPresence) syncCurrentSession() else loadSessionMessages(sessionId, sessionGeneration)
+        } else {
+            drainPendingQueue()
+        }
+    }
+
+    /** Discard is destructive; uncertain sends retain their conversation and receipt. */
+    @Synchronized
+    fun discardPendingSend(id: String) {
+        val row = sendStore.all().firstOrNull { it.id == id } ?: return
+        if (row.scope != sendScope() ||
+            row.sessionId != _uiState.value.currentSessionId ||
+            row.state == PendingSendState.SENDING ||
+            row.state == PendingSendState.UNKNOWN ||
+            synchronized(pendingSendReservationLock) { pendingSendReservations.any { it.pending.id == id } }
+        ) {
+            return
+        }
+        removeUnconfirmedBubble(id)
+        removePendingSend(id)
+        drainPendingQueue()
+    }
+
+    /** Acknowledgment is local metadata, not a delivery receipt or a queue release barrier. */
+    @Synchronized
+    fun acknowledgePendingSend(id: String) {
+        val snapshot = sendStore.all().firstOrNull { it.id == id } ?: return
+        val state = _uiState.value
+        val generation = sessionGeneration
+        if (snapshot.state != PendingSendState.UNKNOWN ||
+            snapshot.userOrderingReleased ||
+            snapshot.scope != sendScope() ||
+            snapshot.sessionId != state.currentSessionId ||
+            !isCurrentSessionRequest(snapshot.sessionId, generation) ||
+            runtimeSessionId == null ||
+            !state.isSessionReady ||
+            wsClient.connectionStatus.value != ConnectionStatus.CONNECTED ||
+            mainTurnBusy ||
+            queueDrainJob?.isActive == true ||
+            queuedStagingIds.contains(id) ||
+            sendStore.all().any {
+                it.scope == snapshot.scope &&
+                    it.sessionId == snapshot.sessionId &&
+                    it.state == PendingSendState.SENDING
+            } ||
+            synchronized(pendingSendReservationLock) {
+                pendingSendReservations.any { it.scope == snapshot.scope && it.storageSessionId == snapshot.sessionId }
+            }
+        ) {
+            return
+        }
+        // Recheck the captured identity just before persisting; no REST/WS call or queue drain.
+        if (generation != sessionGeneration || sendStore.all().firstOrNull { it.id == id } != snapshot) return
+        try {
+            sendStore.update(id) { it.copy(userOrderingReleased = true) }
+        } catch (_: IllegalStateException) {
+            _uiState.update {
+                it.copy(
+                    errorMessage = getApplication<Application>().getString(R.string.chat_pending_acknowledge_failed),
+                )
+            }
+            return
+        }
+        publishPendingSends()
+    }
+
+    /** Forget only the captured local receipt; leave conversation and attachment files untouched. */
+    @Synchronized
+    fun removeAcknowledgedPendingSend(snapshot: PendingSend) {
+        val generation = sessionGeneration
+        if (snapshot.scope != sendScope() ||
+            snapshot.sessionId != _uiState.value.currentSessionId ||
+            !isCurrentSessionRequest(snapshot.sessionId, generation) ||
+            synchronized(pendingSendReservationLock) { pendingSendReservations.any { it.pending.id == snapshot.id } }
+        ) {
+            return
+        }
+        val removed =
+            try {
+                sendStore.dismissReleasedUnknown(snapshot)
+            } catch (_: IllegalStateException) {
+                _uiState.update {
+                    it.copy(errorMessage = getApplication<Application>().getString(R.string.chat_pending_remove_failed))
+                }
+                return
+            }
+        if (!removed) return
+        publishPendingSends()
+    }
+
+    /** A manual promotion is the only path that may retry an uncertain send. */
+    @Synchronized
+    fun sendQueuedNow(id: String) {
+        val row = sendStore.all().firstOrNull { it.id == id } ?: return
+        if (row.scope != sendScope() ||
+            row.sessionId != _uiState.value.currentSessionId ||
+            runtimeSessionId == null ||
+            !_uiState.value.isSessionReady ||
+            wsClient.connectionStatus.value != ConnectionStatus.CONNECTED
+        ) {
+            return
+        }
+        if (row.state !in
+            setOf(
+                PendingSendState.QUEUED,
+                PendingSendState.PARKED,
+                PendingSendState.REJECTED,
+                PendingSendState.UNKNOWN,
+                PendingSendState.ACCEPTED,
+            )
+        ) {
+            return
+        }
+        if (queueDrainJob?.isActive == true ||
+            synchronized(pendingSendReservationLock) { pendingSendReservations.any { it.pending.id == id } }
+        ) {
+            return
+        }
+        val others =
+            sendStore.all().any {
+                it.id != id &&
+                    it.scope == row.scope &&
+                    it.sessionId == row.sessionId &&
+                    it.state == PendingSendState.SENDING
+            }
+        if (others) {
+            _uiState.update { it.copy(errorMessage = "Wait for the current send to settle") }
+            return
+        }
+        if (row.attachments.isNotEmpty()) {
+            val runtimeId = runtimeSessionId ?: return
+            val generation = sessionGeneration
+            val wasStreaming = mainTurnBusy
+            val message =
+                _uiState.value.messages.firstOrNull { it.id == row.id }
+                    ?: ChatMessage(
+                        id = row.id,
+                        role = MessageRole.USER,
+                        content = row.text,
+                        attachments = row.attachments,
+                    )
+            enqueuePendingSendReservation(
+                PendingSendReservation(
+                    pending =
+                        row.copy(
+                            mode = if (wasStreaming) BusySendMode.INTERRUPT else BusySendMode.QUEUE,
+                            state = PendingSendState.SENDING,
+                            attempts = row.attempts + 1,
+                            // A retry is a new attempt; the earlier local acknowledgment is not transferable.
+                            userOrderingReleased = false,
+                        ),
+                    userMessage = message,
+                    wasStreaming = wasStreaming,
+                    storageSessionId = row.sessionId,
+                    agentSessionId = runtimeId,
+                    scope = row.scope,
+                    generation = generation,
+                    mainTurnEpoch = mainTurnEpoch,
+                    originalPending = row,
+                ),
+            )
+            return
+        }
+        sendStore.promote(id)
+        publishPendingSends()
+        if (mainTurnBusy) {
+            val runtimeId = runtimeSessionId ?: return
+            val owner = captureSendOwner(row.sessionId, runtimeId, row.scope, sessionGeneration)
+            val interruptedTurnEpoch = mainTurnEpoch
+            viewModelScope.launch {
+                commitReceiptAndEnqueue(
+                    owner,
+                    row.copy(
+                        state = PendingSendState.SENDING,
+                        attempts = row.attempts + 1,
+                        userOrderingReleased = false,
+                    ),
+                    row,
+                    deleteSnapshotOnRollback = false,
+                ) {
+                    wsClient.send(
+                        RpcMethods.SESSION_INTERRUPT,
+                        SessionInterruptParams(owner.agentSessionId),
+                        onSent = { requestId -> trackHardInterrupt(requestId, id, owner, interruptedTurnEpoch) },
+                    )
+                }
+            }
+        } else {
+            drainPendingQueue()
+        }
+    }
+
     /**
      * Send a user prompt, uploading any pending attachments to the backend
      * first via their dedicated RPC methods.
@@ -1790,7 +3210,10 @@ class ChatViewModel(
      * 6. For each file → await `file.attach` (requires session_id), collect @file: refs
      * 7. Send `prompt.submit` with text + @file: refs — images auto-picked up by backend
      */
-    fun sendMessage(text: String): Boolean {
+    fun sendMessage(
+        text: String,
+        modeOverride: BusySendMode? = null,
+    ): Boolean {
         if (!canSubmitMessage()) return false
         if (text.isBlank() && _uiState.value.pendingAttachments.isEmpty()) return false
 
@@ -1814,17 +3237,43 @@ class ChatViewModel(
             _uiState.update {
                 it.copy(
                     errorMessage = attachmentTooLargeMessage(oversizedAttachment),
-                    composerTextToRestore = text,
                 )
             }
-            return true
+            return false
         }
 
-        // Snapshot + clear attachments so the input bar empties immediately
         val attachments = _uiState.value.pendingAttachments.toList()
-        clearAttachments()
+        val submissionKey =
+            listOf(_uiState.value.currentSessionId, text, attachments.joinToString { it.uri }).joinToString("\u001f")
+        val now = System.nanoTime()
+        if (submissionKey == lastSubmissionKey && now - lastSubmissionAt < 500_000_000L) return false
+        val wasStreaming = mainTurnBusy
+        val clickedMainTurnEpoch = mainTurnEpoch
+        val hasOutstandingDelivery =
+            sendStore.all().any {
+                it.scope == sendScope() &&
+                    it.sessionId == _uiState.value.currentSessionId &&
+                    it.state == PendingSendState.SENDING
+            } ||
+                hasPendingSendReservation(sendScope(), _uiState.value.currentSessionId)
+        val busy = wasStreaming || hasOutstandingDelivery
+        val selectedMode = modeOverride ?: _uiState.value.busySendMode
+        val mode =
+            when {
+                selectedMode == BusySendMode.INTERRUPT && !wasStreaming && hasOutstandingDelivery -> {
+                    BusySendMode.QUEUE
+                }
 
-        val wasStreaming = _uiState.value.isAgentTyping
+                busy &&
+                    selectedMode != BusySendMode.INTERRUPT &&
+                    (attachments.isNotEmpty() || !wasStreaming) -> {
+                    BusySendMode.QUEUE
+                }
+
+                else -> {
+                    selectedMode
+                }
+            }
 
         val userMessage =
             ChatMessage(
@@ -1832,23 +3281,136 @@ class ChatViewModel(
                 content = text,
                 attachments = if (attachments.isNotEmpty()) attachments else null,
                 tokenCount = TokenEstimator.estimate(text).takeIf { it > 0 },
+                messageProvenance = MessageProvenance.LOCAL_PENDING,
             )
-
-        // Update UI immediately
-        _uiState.update { state ->
-            state.copy(
-                messages = state.messages + userMessage,
-                isAgentTyping = true,
-            )
-        }
 
         val storageSessionId = _uiState.value.currentSessionId
         val agentSessionId = runtimeSessionId
+        val scope = sendScope()
+        val createdAt = nextPendingSendCreatedAt()
+        if (storageSessionId != null &&
+            agentSessionId != null &&
+            (attachments.isNotEmpty() || hasPendingSendReservation(scope, storageSessionId))
+        ) {
+            val generation = sessionGeneration
+            val pending =
+                PendingSend(
+                    id = userMessage.id,
+                    scope = scope,
+                    sessionId = storageSessionId,
+                    text = text,
+                    attachments = attachments,
+                    mode = mode,
+                    state =
+                        if (busy && mode == BusySendMode.QUEUE) {
+                            PendingSendState.QUEUED
+                        } else {
+                            PendingSendState.SENDING
+                        },
+                    createdAt = createdAt,
+                )
+            lastSubmissionKey = submissionKey
+            lastSubmissionAt = now
+            clearAttachments()
+            enqueuePendingSendReservation(
+                PendingSendReservation(
+                    pending = pending,
+                    userMessage = userMessage,
+                    wasStreaming = wasStreaming,
+                    storageSessionId = storageSessionId,
+                    agentSessionId = agentSessionId,
+                    scope = scope,
+                    generation = generation,
+                    mainTurnEpoch = clickedMainTurnEpoch,
+                ),
+            )
+            return true
+        }
+        if (storageSessionId != null && agentSessionId != null && busy && mode == BusySendMode.QUEUE) {
+            try {
+                sendStore.put(
+                    PendingSend(
+                        id = userMessage.id,
+                        scope = scope,
+                        sessionId = storageSessionId,
+                        text = text,
+                        attachments = attachments,
+                        mode = mode,
+                        createdAt = createdAt,
+                        state =
+                            if (busy && mode == BusySendMode.QUEUE) {
+                                PendingSendState.QUEUED
+                            } else {
+                                PendingSendState.SENDING
+                            },
+                    ),
+                )
+            } catch (e: Exception) {
+                _uiState.update { it.copy(errorMessage = "Could not save message for delivery") }
+                return false
+            }
+        }
+        lastSubmissionKey = submissionKey
+        lastSubmissionAt = now
+        clearAttachments()
+
+        _uiState.update { state ->
+            state.copy(
+                messages = state.messages + userMessage,
+                isSending = true,
+            )
+        }
+        publishPendingSends()
 
         if (storageSessionId == null || agentSessionId == null) {
             // Issue #969: Session creation is still in-flight. Hold the prompt
             // so it is dispatched automatically the moment SESSION_CREATE lands.
-            pendingInitialPrompt = PendingPrompt(text, attachments, wasStreaming, userMessage)
+            pendingInitialPrompt =
+                PendingPrompt(text, attachments, wasStreaming, userMessage, createdAt, clickedMainTurnEpoch)
+            publishPendingSends()
+            return true
+        }
+
+        if (busy && mode == BusySendMode.QUEUE) {
+            queuedStagingIds.add(userMessage.id)
+            viewModelScope.launch(ioDispatcher) {
+                try {
+                    stageQueuedAttachments(sendStore.all().first { it.id == userMessage.id })
+                    repo.persistMessage(userMessage, storageSessionId)
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    failOutgoingBeforeSubmit(userMessage.id, "Could not retain queued attachment")
+                } finally {
+                    queuedStagingIds.remove(userMessage.id)
+                    drainPendingQueue()
+                }
+            }
+            return true
+        }
+
+        if (wasStreaming && mode == BusySendMode.INTERRUPT) {
+            val owner = captureSendOwner(storageSessionId, agentSessionId, scope, sessionGeneration)
+            val interruptedTurnEpoch = mainTurnEpoch
+            val receipt =
+                PendingSend(
+                    id = userMessage.id,
+                    scope = scope,
+                    sessionId = storageSessionId,
+                    text = text,
+                    attachments = attachments,
+                    mode = mode,
+                    state = PendingSendState.SENDING,
+                    createdAt = createdAt,
+                )
+            viewModelScope.launch {
+                commitReceiptAndEnqueue(owner, receipt, null, deleteSnapshotOnRollback = false) {
+                    wsClient.send(
+                        RpcMethods.SESSION_INTERRUPT,
+                        SessionInterruptParams(owner.agentSessionId),
+                        onSent = { id -> trackHardInterrupt(id, userMessage.id, owner, interruptedTurnEpoch) },
+                    )
+                }
+            }
             return true
         }
 
@@ -1859,8 +3421,128 @@ class ChatViewModel(
             storageSessionId = storageSessionId,
             agentSessionId = agentSessionId,
             userMessage = userMessage,
+            mode = if (wasStreaming) mode else BusySendMode.CORRECT,
+            owner = captureSendOwner(storageSessionId, agentSessionId, scope),
+            pendingReceipt =
+                PendingSend(
+                    id = userMessage.id,
+                    scope = scope,
+                    sessionId = storageSessionId,
+                    text = text,
+                    attachments = attachments,
+                    mode = if (wasStreaming) mode else BusySendMode.CORRECT,
+                    state = PendingSendState.SENDING,
+                    createdAt = createdAt,
+                ),
         )
         return true
+    }
+
+    /** True while a voice-note transcription owns the mic-to-send pipeline. */
+    private var voiceNoteTranscriptionInFlight = false
+
+    /**
+     * Transcribe a recorded voice note through the dashboard's server-side
+     * STT relay (`POST /api/audio/transcribe` — the desktop client's voice
+     * path) and submit the transcript as the next message. The profile's
+     * configured STT provider answers, not the phone's on-device recognizer.
+     *
+     * The recording belongs to the session that was active when it was taken:
+     * transcription takes long enough for the socket, the profile, or the user
+     * to move on, so a transcript that can no longer land in that session or
+     * connection/profile scope is preserved in the composer instead of being
+     * dropped. Only one
+     * transcription runs at a time — [voiceNoteTranscriptionInFlight] keeps
+     * every branch below single-flight (review, PR #1250).
+     */
+    fun sendVoiceNote(file: File) {
+        if (voiceNoteTranscriptionInFlight) {
+            file.delete()
+            return
+        }
+        if (!canSubmitMessage()) {
+            file.delete()
+            _uiState.update { it.copy(errorMessage = VOICE_NOTE_OFFLINE_MESSAGE) }
+            return
+        }
+        val recordedSessionId = _uiState.value.currentSessionId
+        val recordedRuntimeSessionId = runtimeSessionId
+        // The recording also belongs to the connection/profile scope it was
+        // taken on: both session IDs can still be null/null across a scope
+        // switch while a replacement session create is pending, so the data
+        // scope is the deciding identity for that window (review, PR #1250).
+        val recordedDataScope = AuthManager.currentDataScope()
+        voiceNoteTranscriptionInFlight = true
+        viewModelScope.launch {
+            _uiState.update { it.copy(isTranscribingVoiceNote = true) }
+            try {
+                val result =
+                    withContext(ioDispatcher) {
+                        try {
+                            voiceNoteRepository.transcribe(file)
+                        } finally {
+                            file.delete()
+                        }
+                    }
+                when (result) {
+                    is NetworkResult.Success -> {
+                        val transcript = result.data.trim()
+                        if (transcript.isEmpty()) {
+                            _uiState.update { it.copy(errorMessage = VOICE_NOTE_EMPTY_MESSAGE) }
+                        } else {
+                            deliverVoiceTranscript(
+                                transcript = transcript,
+                                recordedSessionId = recordedSessionId,
+                                recordedRuntimeSessionId = recordedRuntimeSessionId,
+                                recordedDataScope = recordedDataScope,
+                            )
+                        }
+                    }
+
+                    is NetworkResult.Failure -> {
+                        Log.w(TAG, "Voice note transcription failed: ${result.error.message}")
+                        _uiState.update {
+                            it.copy(errorMessage = "$VOICE_NOTE_FAILED_MESSAGE: ${result.error.message}")
+                        }
+                    }
+                }
+            } finally {
+                // Always release the single-flight flag and the composer's
+                // transcription state, even if a branch above throws.
+                voiceNoteTranscriptionInFlight = false
+                _uiState.update { it.copy(isTranscribingVoiceNote = false) }
+            }
+        }
+    }
+
+    /**
+     * Submits a transcribed voice note, or keeps the transcript in the input
+     * field when it can no longer land where it was recorded. The recording
+     * file is already deleted by now, so a rejected send restores the text
+     * instead of losing it.
+     */
+    private fun deliverVoiceTranscript(
+        transcript: String,
+        recordedSessionId: String?,
+        recordedRuntimeSessionId: String?,
+        recordedDataScope: DataScope?,
+    ) {
+        val sessionChanged =
+            _uiState.value.currentSessionId != recordedSessionId ||
+                runtimeSessionId != recordedRuntimeSessionId
+        // A connection/profile switch can leave the session IDs null on both
+        // sides of the recording (a replacement session create may still be
+        // pending), so the data scope is the ownership check that catches
+        // that move (review, PR #1250).
+        val scopeChanged = AuthManager.currentDataScope() != recordedDataScope
+        if (sessionChanged || scopeChanged || !sendMessage(transcript)) {
+            _uiState.update {
+                it.copy(
+                    composerTextToRestore = transcript,
+                    errorMessage = VOICE_NOTE_UNSENT_MESSAGE,
+                )
+            }
+        }
     }
 
     private fun canSubmitMessage(): Boolean =
@@ -1885,8 +3567,15 @@ class ChatViewModel(
         storageSessionId: String,
         agentSessionId: String,
         userMessage: ChatMessage? = null,
-    ) {
-        val dispatchGeneration = sessionGeneration
+        mode: BusySendMode = BusySendMode.CORRECT,
+        queued: Boolean = false,
+        owner: SendOwner = captureSendOwner(storageSessionId, agentSessionId),
+        pendingReceipt: PendingSend? = null,
+        rollbackReceipt: PendingSend? = null,
+        deleteSnapshotOnRollback: Boolean = false,
+        outboundAlreadyStarted: Boolean = false,
+    ): Job {
+        val dispatchGeneration = owner.generation
         AuthManager.setLastOpenedSessionId(storageSessionId)
         val msgToPersist =
             userMessage ?: ChatMessage(
@@ -1894,17 +3583,54 @@ class ChatViewModel(
                 content = text,
                 attachments = if (attachments.isNotEmpty()) attachments else null,
                 tokenCount = TokenEstimator.estimate(text).takeIf { it > 0 },
+                messageProvenance = MessageProvenance.LOCAL_PENDING,
             )
+        val attemptedReceipt =
+            pendingReceipt
+                ?: sendStore.all().firstOrNull { it.id == msgToPersist.id }?.copy(state = PendingSendState.SENDING)
+                ?: PendingSend(
+                    id = msgToPersist.id,
+                    scope = owner.scope,
+                    sessionId = owner.storageSessionId,
+                    text = text,
+                    attachments = attachments,
+                    mode = mode,
+                    state = PendingSendState.SENDING,
+                )
 
-        // Upload attachments then submit prompt
-        viewModelScope.launch(ioDispatcher) {
+        // PR #1254: callers draining FIFO work retain ownership until preparation/enqueue ends.
+        return viewModelScope.launch(ioDispatcher) {
             val fileRefs = mutableListOf<String>()
             val preparedAttachments = mutableListOf<PreparedAttachment>()
+            var receiptCommitted = outboundAlreadyStarted
+            var outboundStarted = outboundAlreadyStarted
+
+            suspend fun <T> enqueueOwned(action: () -> T): T? {
+                val value =
+                    if (!receiptCommitted) {
+                        commitReceiptAndEnqueue(
+                            owner,
+                            attemptedReceipt,
+                            rollbackReceipt,
+                            deleteSnapshotOnRollback,
+                            action,
+                        )
+                    } else {
+                        withCurrentSendOwner(owner, action)
+                    }
+                if (value == null) {
+                    if (outboundStarted) {
+                        sendStore.update(msgToPersist.id) { it.copy(state = PendingSendState.UNKNOWN) }
+                        publishPendingSends()
+                    }
+                    return null
+                }
+                receiptCommitted = true
+                outboundStarted = true
+                return value
+            }
 
             try {
-                // Snapshot every attachment before the first RPC. This closes the
-                // content-URI TOCTOU window without retaining multiple Base64
-                // strings in the heap: encoded snapshots live in private cache.
                 for (attachment in attachments) {
                     when (val result = prepareAttachment(attachment)) {
                         is PrepareAttachmentResult.Success -> {
@@ -1912,30 +3638,81 @@ class ChatViewModel(
                         }
 
                         PrepareAttachmentResult.TooLarge -> {
-                            rejectOversizedAttachment(
-                                attachment = attachment,
-                                attachments = attachments,
-                                message = msgToPersist,
-                                wasStreaming = wasStreaming,
-                                generation = dispatchGeneration,
-                            )
+                            if (!outboundStarted) {
+                                restoreKnownUnsentReceipt(
+                                    attemptedReceipt,
+                                    rollbackReceipt,
+                                    deleteSnapshotOnRollback,
+                                )
+                            }
+                            if (!outboundStarted && rollbackReceipt != null) {
+                                withCurrentSendOwner(owner) {
+                                    removeUnconfirmedBubble(msgToPersist.id)
+                                    _uiState.update { it.copy(errorMessage = attachmentTooLargeMessage(attachment)) }
+                                }
+                            } else {
+                                rejectOversizedAttachment(
+                                    attachment,
+                                    attachments,
+                                    msgToPersist,
+                                    wasStreaming,
+                                    dispatchGeneration,
+                                )
+                            }
                             return@launch
                         }
 
                         PrepareAttachmentResult.Unreadable -> {
-                            Log.w(TAG, "Skipping unreadable attachment: ${attachment.name}")
+                            if (!outboundStarted) {
+                                restoreKnownUnsentReceipt(
+                                    attemptedReceipt,
+                                    rollbackReceipt,
+                                    deleteSnapshotOnRollback,
+                                )
+                            }
+                            if (!outboundStarted && rollbackReceipt != null) {
+                                withCurrentSendOwner(owner) {
+                                    removeUnconfirmedBubble(msgToPersist.id)
+                                    _uiState.update {
+                                        it.copy(
+                                            errorMessage = "Attachment unavailable: ${attachment.name}",
+                                            isAgentTyping = mainTurnBusy,
+                                        )
+                                    }
+                                }
+                            } else {
+                                failOutgoingBeforeSubmit(
+                                    msgToPersist.id,
+                                    "Attachment unavailable: ${attachment.name}",
+                                    dispatchGeneration,
+                                )
+                            }
+                            return@launch
                         }
                     }
                 }
 
-                // Persist only after every readable attachment has a bounded,
-                // immutable snapshot and no partial server upload can occur.
+                if (withCurrentSendOwner(owner) { true } != true) {
+                    if (!outboundStarted) {
+                        restoreKnownUnsentReceipt(
+                            attemptedReceipt,
+                            rollbackReceipt,
+                            deleteSnapshotOnRollback,
+                        )
+                    }
+                    return@launch
+                }
                 try {
-                    repo.persistMessage(msgToPersist, storageSessionId)
+                    repo.persistMessage(msgToPersist, owner.storageSessionId)
                 } catch (e: Exception) {
-                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    if (e is CancellationException) throw e
                     Log.e(TAG, "Failed to persist outgoing message", e)
-                    if (dispatchGeneration == sessionGeneration) {
+                    if (outboundStarted) {
+                        sendStore.update(msgToPersist.id) { it.copy(state = PendingSendState.UNKNOWN) }
+                    } else {
+                        restoreKnownUnsentReceipt(attemptedReceipt, rollbackReceipt, deleteSnapshotOnRollback)
+                    }
+                    if (isCurrentSendContext(owner)) {
                         _uiState.update { state ->
                             state.copy(
                                 messages = state.messages.filterNot { it.id == msgToPersist.id },
@@ -1951,68 +3728,58 @@ class ChatViewModel(
 
                 for ((attachment, encodedFile) in preparedAttachments) {
                     try {
-                        // Materialize one bounded Base64 payload at a time. The
-                        // awaited RPC completes before the next snapshot is read.
                         val b64 = encodedFile.readText(Charsets.US_ASCII)
-
                         if (attachment.isImage) {
-                            // Await so the backend stages the image into
-                            // session["attached_images"] BEFORE prompt.submit runs
-                            // (a fire-and-forget send raced prompt.submit and the
-                            // image was dropped). Requires session_id or the gateway
-                            // 4001s "session not found" (desktop passes it too).
-                            val result =
-                                sendRpcAndAwait(
-                                    method = WsMethods.IMAGE_ATTACH_BYTES,
-                                    params =
-                                        mapOf(
-                                            "session_id" to agentSessionId,
-                                            "content_base64" to "data:${attachment.mimeType};base64,$b64",
-                                            "filename" to attachment.name,
-                                            "ext" to attachment.fileExtension,
+                            val deferred =
+                                enqueueOwned {
+                                    wsClient.requestTyped(
+                                        RpcMethods.IMAGE_ATTACH_BYTES,
+                                        ImageAttachBytesParams(
+                                            sessionId = owner.agentSessionId,
+                                            contentBase64 = "data:${attachment.mimeType};base64,$b64",
+                                            filename = attachment.name,
+                                            ext = attachment.fileExtension,
                                         ),
-                                ).let { if (it is JsonElement) it.toAny() else it }
-                            if (result != null) {
-                                @Suppress("UNCHECKED_CAST")
-                                val ok = (result as? Map<String, Any?>)?.get("attached") as? Boolean
-                                if (ok != true) {
-                                    Log.w(TAG, "Image attach for ${attachment.name} returned non-ok: $result")
-                                }
-                            }
-                        } else {
-                            // Await the @file: ref text so we can embed it in the prompt.
-                            // file.attach also requires session_id or the gateway 4001s
-                            // "session not found" (same resolver as image.attach_bytes).
-                            sendRpcAndAwait(
-                                method = WsMethods.FILE_ATTACH,
-                                params =
-                                    mapOf(
-                                        "session_id" to agentSessionId,
-                                        "data_url" to "data:${attachment.mimeType};base64,$b64",
-                                        "name" to attachment.name,
-                                    ),
-                            )?.let { response ->
-                                // request() returns raw JsonElement values; normalize before reading Kotlin types.
-                                val result = if (response is JsonElement) response.toAny() else response
+                                    )
+                                } ?: return@launch
+                            val response = deferred.await()
+                            val result = if (response is JsonElement) response.toAny() else response
 
-                                @Suppress("UNCHECKED_CAST")
-                                val refText =
-                                    (result as? Map<String, Any?>)?.get("ref_text") as? String
-                                if (!refText.isNullOrBlank()) fileRefs.add(refText)
-                            }
+                            @Suppress("UNCHECKED_CAST")
+                            val ok = (result as? Map<String, Any?>)?.get("attached") as? Boolean
+                            if (ok != true) error("Image attachment was not accepted")
+                        } else {
+                            val deferred =
+                                enqueueOwned {
+                                    wsClient.requestTyped(
+                                        RpcMethods.FILE_ATTACH,
+                                        FileAttachParams(
+                                            sessionId = owner.agentSessionId,
+                                            dataUrl = "data:${attachment.mimeType};base64,$b64",
+                                            name = attachment.name,
+                                        ),
+                                    )
+                                } ?: return@launch
+                            val response = deferred.await()
+                            val result = if (response is JsonElement) response.toAny() else response
+
+                            @Suppress("UNCHECKED_CAST")
+                            val refText = (result as? Map<String, Any?>)?.get("ref_text") as? String
+                            if (refText.isNullOrBlank()) error("File attachment was not accepted")
+                            fileRefs.add(refText)
                         }
                     } catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        if (e is CancellationException) throw e
                         Log.e(TAG, "Failed to upload attachment ${attachment.name}", e)
-                        if (dispatchGeneration == sessionGeneration) {
-                            _uiState.update {
-                                it.copy(errorMessage = "Upload failed: ${attachment.name}")
-                            }
-                        }
+                        failOutgoingBeforeSubmit(
+                            msgToPersist.id,
+                            "Upload failed: ${attachment.name}",
+                            dispatchGeneration,
+                        )
+                        return@launch
                     }
                 }
 
-                // Build prompt text — prepend @file: refs for non-image files
                 val fullText =
                     if (fileRefs.isEmpty()) {
                         text
@@ -2020,53 +3787,69 @@ class ChatViewModel(
                         fileRefs.joinToString("\n") +
                             if (text.isNotBlank()) "\n\n$text" else ""
                     }
-
-                if (dispatchGeneration != sessionGeneration) return@launch
-
-                // While a turn is actively streaming and this is a plain text prompt
-                // (no attachments — session.redirect carries text only), steer the
-                // in-flight turn via session.redirect instead of queueing a fresh
-                // prompt.submit. The backend rewrites the live turn when it can, or
-                // queues the correction as the next turn otherwise (issue #710).
-                if (dispatchGeneration == sessionGeneration) {
-                    ActiveSessionHolder.set(agentSessionId, storageSessionId)
+                if (isCurrentSendContext(owner)) {
+                    ActiveSessionHolder.set(
+                        owner.agentSessionId,
+                        owner.storageSessionId,
+                    )
                 }
                 captureTurnUsageBaselineIfNeeded()
-                if (wasStreaming && attachments.isEmpty()) {
-                    wsClient.sendRedirect(
-                        agentSessionId,
-                        fullText,
-                        onSent = { id ->
-                            trackSessionRequest(
-                                id = id,
-                                method = WsMethods.SESSION_REDIRECT,
-                                generation = dispatchGeneration,
-                                sessionId = storageSessionId,
-                            )
-                        },
-                    )
+                if (wasStreaming && attachments.isEmpty() && !queued) {
+                    val sent =
+                        if (mode == BusySendMode.GUIDE) {
+                            enqueueOwned {
+                                wsClient.send(
+                                    RpcMethods.SESSION_STEER,
+                                    SessionCorrectionParams(owner.agentSessionId, fullText),
+                                    onSent = { id ->
+                                        trackOutgoingRequest(
+                                            id,
+                                            msgToPersist.id,
+                                            WsMethods.SESSION_STEER,
+                                            dispatchGeneration,
+                                            owner.storageSessionId,
+                                        )
+                                    },
+                                )
+                            }
+                        } else {
+                            enqueueOwned {
+                                wsClient.sendRedirect(
+                                    owner.agentSessionId,
+                                    fullText,
+                                    onSent = { id ->
+                                        trackOutgoingRequest(
+                                            id,
+                                            msgToPersist.id,
+                                            WsMethods.SESSION_REDIRECT,
+                                            dispatchGeneration,
+                                            owner.storageSessionId,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                    if (sent == null) return@launch
                 } else {
-                    // Arm the durable turn boundary BEFORE prompt.submit leaves
-                    // the device: the REST high-watermark has to be read while
-                    // the reply row cannot exist yet. A failed capture is
-                    // non-fatal — the prompt is still sent, the turn just
-                    // becomes uncorrelatable and its reply notification is never
-                    // auto-dismissed from hydration instead of being bound to a
-                    // guessed row.
-                    prepareTurnCorrelation(storageSessionId)
-                    if (dispatchGeneration != sessionGeneration) return@launch
-                    wsClient.sendMessage(
-                        agentSessionId,
-                        fullText,
-                        onSent = { id ->
-                            trackSessionRequest(
-                                id = id,
-                                method = WsMethods.PROMPT_SUBMIT,
-                                generation = dispatchGeneration,
-                                sessionId = storageSessionId,
+                    if (!queued) prepareTurnCorrelation(owner.storageSessionId)
+                    val sent =
+                        enqueueOwned {
+                            wsClient.sendMessage(
+                                owner.agentSessionId,
+                                fullText,
+                                onSent = { id ->
+                                    trackOutgoingRequest(
+                                        id,
+                                        msgToPersist.id,
+                                        WsMethods.PROMPT_SUBMIT,
+                                        dispatchGeneration,
+                                        owner.storageSessionId,
+                                    )
+                                },
+                                queued = queued,
                             )
-                        },
-                    )
+                        }
+                    if (sent == null) return@launch
                 }
             } finally {
                 preparedAttachments.forEach { it.encodedFile.delete() }
@@ -2139,6 +3922,7 @@ class ChatViewModel(
     ) {
         Log.w(TAG, "Rejecting oversized attachment: ${attachment.name}")
         if (generation != sessionGeneration) return
+        removePendingSend(message.id)
         _uiState.update { state ->
             state.copy(
                 messages = state.messages.filterNot { it.id == message.id },
@@ -2152,18 +3936,6 @@ class ChatViewModel(
 
     private fun attachmentTooLargeMessage(attachment: Attachment): String =
         "Attachment too large: ${attachment.name} (maximum 10 MB)"
-
-    /**
-     * Send a JSON-RPC call and suspend until the response arrives, delegating
-     * the deferred + 120s timeout to [HermesWsClient.request] (issue #526).
-     * Throws [HermesWsClient.HermesRpcException] on RPC error, or
-     * [kotlinx.coroutines.TimeoutCancellationException] if the server never
-     * answers within the timeout.
-     */
-    private suspend fun sendRpcAndAwait(
-        method: String,
-        params: Map<String, Any>,
-    ): Any? = HermesWsClient.request(method, params).await()
 
     // ── Attachment management ─────────────────────────────────────────────
 
@@ -2180,6 +3952,34 @@ class ChatViewModel(
     ) = attachmentsDelegate.addAttachment(uri, name, mimeType, size)
 
     fun addAttachments(attachments: List<Attachment>) = attachmentsDelegate.addAttachments(attachments)
+
+    /** Clipboard reads are asynchronous: bind them to this exact session generation and server. */
+    internal fun captureAttachmentTarget(): ChatAttachmentTarget? {
+        val state = _uiState.value
+        val sessionId = state.currentSessionId ?: return null
+        // Connection status is combined into public uiState, not written to _uiState.
+        if (wsClient.connectionStatus.value != ConnectionStatus.CONNECTED ||
+            !state.isSessionReady || _timelineState.value.isHistorical
+        ) {
+            return null
+        }
+        return ChatAttachmentTarget(
+            sessionId = sessionId,
+            generation = sessionGeneration,
+            baseUrl = AuthManager.getBaseUrl(),
+            connectionProfileId = AuthManager.getSelectedProfileId(),
+            agentProfileId = AuthManager.activeProfileId.value,
+        )
+    }
+
+    internal fun addPastedAttachments(
+        target: ChatAttachmentTarget,
+        attachments: List<Attachment>,
+    ): Boolean {
+        if (captureAttachmentTarget() != target) return false
+        attachmentsDelegate.addAttachments(attachments)
+        return true
+    }
 
     fun removeAttachment(index: Int) = attachmentsDelegate.removeAttachment(index)
 
@@ -2217,21 +4017,25 @@ class ChatViewModel(
         val displayContent =
             if (result is SlashResult.QueuePrompt) result.displayContent else command
         val userMsg =
-            ChatMessage(
-                role = MessageRole.USER,
-                content = displayContent,
-                tokenCount = TokenEstimator.estimate(displayContent).takeIf { it > 0 },
+            appendLocalTranscriptEvent(
+                message =
+                    ChatMessage(
+                        role = MessageRole.USER,
+                        content = displayContent,
+                        tokenCount = TokenEstimator.estimate(displayContent).takeIf { it > 0 },
+                        // Follow-up to #1253: stripped /queue text is an unconfirmed prompt,
+                        // not a permanently-local command or an ambiguous legacy cache row.
+                        messageProvenance =
+                            if (result is SlashResult.QueuePrompt && displayContent != command) {
+                                MessageProvenance.LOCAL_PENDING
+                            } else {
+                                MessageProvenance.UNKNOWN
+                            },
+                    ),
+                // Fix #1437 follow-up: an empty /queue is local feedback, not a staged prompt.
+                // Only stripped, nonempty queue prompts defer persistence to the send pipeline.
+                persist = result !is SlashResult.QueuePrompt || displayContent == command,
             )
-        val sessionId = _uiState.value.currentSessionId
-
-        _uiState.update { it.copy(messages = it.messages + userMsg) }
-
-        // Persist — OUTSIDE update{}
-        if (sessionId != null) {
-            viewModelScope.launch(ioDispatcher) {
-                repo.persistMessage(userMsg, sessionId)
-            }
-        }
 
         if (result is SlashResult.Undo) {
             handleUndoCommand(result.count)
@@ -2261,6 +4065,10 @@ class ChatViewModel(
         when (result) {
             is SlashResult.Interrupt -> {
                 interruptSession()
+            }
+
+            is SlashResult.Stop -> {
+                stopSessionAndProcesses()
             }
 
             is SlashResult.NewSession -> {
@@ -2306,7 +4114,7 @@ class ChatViewModel(
             }
 
             is SlashResult.QueuePrompt -> {
-                handleQueueCommand(command)
+                handleQueueCommand(command, userMsg)
             }
 
             is SlashResult.SideQuestion -> {
@@ -2315,6 +4123,10 @@ class ChatViewModel(
 
             is SlashResult.Undo -> {
                 handleUndoCommand(result.count)
+            }
+
+            is SlashResult.Compress -> {
+                compressSession(result.focusTopic)
             }
 
             is SlashResult.RpcDispatch -> {
@@ -2332,13 +4144,53 @@ class ChatViewModel(
      * `command.dispatch` `queue` shim only echoes the text back as a plain
      * submit, which loses the queued flag and hijacks the live turn.
      */
-    private fun handleQueueCommand(command: String) {
+    private fun handleQueueCommand(
+        command: String,
+        userMessage: ChatMessage,
+    ) {
         val arg = command.split(" ", limit = 2).getOrElse(1) { "" }.trim()
         if (arg.isBlank()) {
             addAssistantMessage("usage: /queue <prompt>")
             return
         }
-        submitPrompt(arg, queued = true)
+        val storageId = _uiState.value.currentSessionId ?: return
+        val runtimeId = runtimeSessionId ?: return
+        val busy =
+            mainTurnBusy ||
+                sendStore.all().any {
+                    it.scope == sendScope() && it.sessionId == storageId && it.state == PendingSendState.SENDING
+                }
+        try {
+            sendStore.put(
+                PendingSend(
+                    id = userMessage.id,
+                    scope = sendScope(),
+                    sessionId = storageId,
+                    text = arg,
+                    mode = BusySendMode.QUEUE,
+                    state = if (busy) PendingSendState.QUEUED else PendingSendState.SENDING,
+                ),
+            )
+        } catch (e: Exception) {
+            removeUnconfirmedBubble(userMessage.id)
+            _uiState.update { it.copy(errorMessage = "Could not save message for delivery") }
+            return
+        }
+        publishPendingSends()
+        if (busy) {
+            viewModelScope.launch(ioDispatcher) { repo.persistMessage(userMessage, storageId) }
+        } else {
+            dispatchPrompt(
+                text = arg,
+                attachments = emptyList(),
+                wasStreaming = false,
+                storageSessionId = storageId,
+                agentSessionId = runtimeId,
+                userMessage = userMessage,
+                mode = BusySendMode.QUEUE,
+                queued = true,
+            )
+        }
     }
 
     private fun handleReasoningSlashCommand(arg: String) {
@@ -2355,14 +4207,10 @@ class ChatViewModel(
             viewModelScope.launch(ioDispatcher) {
                 try {
                     val result =
-                        wsClient
-                            .request(
-                                WsMethods.CONFIG_GET,
-                                mapOf(
-                                    "key" to "reasoning",
-                                    "session_id" to sessionId,
-                                ),
-                            ).await()
+                        wsClient.call(
+                            RpcMethods.CONFIG_GET,
+                            ConfigGetParams(key = "reasoning", sessionId = sessionId),
+                        )
                     val map = rpcResultMap(result) ?: error("Invalid reasoning config.get response")
                     val value = (map["value"] as? String)?.takeIf { it.isNotBlank() } ?: "unknown"
                     val display = (map["display"] as? String)?.takeIf { it.isNotBlank() } ?: "unknown"
@@ -2410,13 +4258,13 @@ class ChatViewModel(
         viewModelScope.launch(ioDispatcher) {
             try {
                 val params =
-                    buildMap<String, Any> {
-                        put("key", "reasoning")
-                        put("value", parsed.value)
-                        put("session_id", sessionId)
-                        parsed.scopeName?.let { put("scope", it) }
-                    }
-                val result = wsClient.request(WsMethods.CONFIG_SET, params).await()
+                    ConfigSetParams(
+                        key = "reasoning",
+                        value = parsed.value,
+                        sessionId = sessionId,
+                        scope = parsed.scopeName,
+                    )
+                val result = wsClient.call(RpcMethods.CONFIG_SET, params)
                 val map = rpcResultMap(result) ?: error("Invalid reasoning config.set response")
                 val responseKey = map["key"] as? String
                 val responseValue = map["value"] as? String
@@ -2464,13 +4312,12 @@ class ChatViewModel(
 
         viewModelScope.launch(ioDispatcher) {
             try {
-                val rpcResult =
+                val taskId =
                     wsClient
-                        .request(
-                            WsMethods.PROMPT_BTW,
-                            mapOf("session_id" to sessionId, "text" to trimmed),
-                        ).await()
-                val taskId = (rpcResult as? Map<*, *>)?.get("task_id") as? String
+                        .call(
+                            RpcMethods.PROMPT_BTW,
+                            PromptBtwParams(sessionId = sessionId, text = trimmed),
+                        ).taskId
                 if (!taskId.isNullOrBlank()) {
                     _uiState.update { state ->
                         state.btwState?.let { current ->
@@ -2545,9 +4392,8 @@ class ChatViewModel(
     }
 
     /**
-     * Fork the active conversation via the session.branch WS RPC (issue #533).
-     * The backend already supports session.branch; the mobile previously had
-     * no client surface, so `/fork` fell through to command.dispatch and 4018'd.
+     * Fork the active conversation via the lightweight session.branch_whole WS RPC (issue #1289).
+     * Falls back to session.branch if the gateway answers -32601 (unknown method).
      * The optional arg becomes the new branch's title.
      */
     private fun branchSession(command: String) {
@@ -2557,14 +4403,16 @@ class ChatViewModel(
             return
         }
         val arg = command.split(" ", limit = 2).getOrElse(1) { "" }.trim()
-        val params = mutableMapOf<String, Any>("session_id" to sessionId)
-        if (arg.isNotBlank()) params["name"] = arg
+        val params = SessionBranchWholeParams(sessionId = sessionId, name = arg.takeIf { it.isNotBlank() })
         val generation = sessionGeneration
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.SESSION_BRANCH,
+                RpcMethods.SESSION_BRANCH_WHOLE,
                 params,
-                onSent = { id -> trackSessionRequest(id, WsMethods.SESSION_BRANCH, generation) },
+                onSent = { id ->
+                    branchWholeRequests[id] = PendingBranchRequest(generation, params)
+                    trackSessionRequest(id, WsMethods.SESSION_BRANCH_WHOLE, generation)
+                },
             )
         }
     }
@@ -2580,46 +4428,46 @@ class ChatViewModel(
         val arg = parts.getOrElse(1) { "" }
         viewModelScope.launch(ioDispatcher) {
             try {
-                // Primary path: command.dispatch handles quick/plugin/bundle/
-                // skill commands + a few hardcoded ones. It returns a hard 4018
-                // "not a ... command" for everything that lives only in the TUI
-                // slash worker (the 29 commands that 4018'd on mobile — issue
-                // #576). For those we fall back to slash.exec, which runs the
-                // full COMMAND_REGISTRY through the worker.
+                // Desktop parity: slash.exec owns generic commands. Handle errors here,
+                // not again through the shared RpcError banner (/usage regression).
                 val result =
-                    wsClient
-                        .request(
-                            WsMethods.COMMAND_DISPATCH,
-                            mapOf("name" to name, "arg" to arg, "session_id" to sessionId),
-                        ).await()
-                handleDispatchResult(result)
-            } catch (e: HermesWsClient.HermesRpcException) {
-                val msg = e.message.orEmpty()
-                // Registry miss on command.dispatch: the backend emits exactly
-                // "not a quick/plugin/bundle/skill command: <name>" (tui_gateway
-                // server.py L12408). Match that precise phrase so unrelated
-                // errors can't accidentally trigger the slash.exec fallback.
-                if (msg.contains("not a quick/plugin/bundle/skill command")) {
-                    // Registry miss on command.dispatch -> retry via slash.exec,
-                    // which routes the full CLI command set through the worker.
-                    try {
-                        val result =
-                            wsClient
-                                .request(
-                                    WsMethods.SLASH_EXEC,
-                                    mapOf(
-                                        "command" to "/$name${if (arg.isNotEmpty()) " $arg" else ""}",
-                                        "session_id" to sessionId,
-                                    ),
-                                ).await()
-                        val output = (result as? Map<*, *>)?.get("output") as? String
-                        if (!output.isNullOrBlank()) addAssistantMessage(output)
-                    } catch (e2: HermesWsClient.HermesRpcException) {
-                        addAssistantMessage("/$name: ${e2.message}")
-                    }
+                    wsClient.call(
+                        RpcMethods.SLASH_EXEC,
+                        SlashExecParams(sessionId = sessionId, command = command.removePrefix("/")),
+                        suppressErrorEvent = true,
+                    )
+                val map = result.toAny() as? Map<*, *>
+                if (map?.get("type") is String) {
+                    handleDispatchResult(map)
                 } else {
-                    // Legit error from command.dispatch (busy, no history, etc.)
-                    addAssistantMessage("/$name: ${e.message}")
+                    val output = (map?.get("output") as? String).orEmpty().ifBlank { "/$name: no output" }
+                    val warning = (map?.get("warning") as? String).orEmpty()
+                    addAssistantMessage(if (warning.isBlank()) output else "warning: $warning\n$output")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                try {
+                    val result =
+                        wsClient.call(
+                            RpcMethods.COMMAND_DISPATCH,
+                            CommandDispatchParams(name = name, arg = arg, sessionId = sessionId),
+                            suppressErrorEvent = true,
+                        )
+                    val map = result.toAny() as? Map<*, *>
+                    if (map?.get("type") is String) {
+                        handleDispatchResult(map)
+                    } else {
+                        addAssistantMessage("/$name: invalid response: command.dispatch")
+                    }
+                } catch (fallback: CancellationException) {
+                    throw fallback
+                } catch (fallback: Exception) {
+                    val registryMiss =
+                        Regex("not a quick/plugin/(?:bundle/)?skill command", RegexOption.IGNORE_CASE)
+                            .containsMatchIn(fallback.message.orEmpty())
+                    val failure = if (registryMiss) e else fallback
+                    addAssistantMessage("/$name: ${failure.message}")
                 }
             }
         }
@@ -2654,22 +4502,84 @@ class ChatViewModel(
         }
     }
 
+    /** Record producer order before IO scheduling can invert command and feedback writes. */
+    private fun appendLocalTranscriptEvent(
+        message: ChatMessage,
+        persist: Boolean = true,
+    ): ChatMessage {
+        val (placed, persistenceJob) =
+            synchronized(localTranscriptAppendLock) {
+                var placed = message
+                var sessionId: String? = null
+                _uiState.update { state ->
+                    placed = message.withLocalTranscriptAnchor(state.messages)
+                    sessionId = state.currentSessionId
+                    state.copy(messages = state.messages + placed)
+                }
+                val capturedMessage = placed
+                val capturedSessionId = sessionId
+                val previousWrite = localTranscriptPersistenceTail
+                val capturedEpoch = capturedSessionId?.let { compressedHistoryEpochs[it]?.first } ?: 0L
+                val job =
+                    if (persist && capturedSessionId != null) {
+                        viewModelScope
+                            .launch(ioDispatcher, start = CoroutineStart.LAZY) {
+                                previousWrite?.join()
+                                val reanchor =
+                                    synchronized(localTranscriptAppendLock) {
+                                        compressedHistoryEpochs[capturedSessionId]
+                                            ?.takeIf { it.first != capturedEpoch }
+                                            ?.second
+                                    }
+                                val persisted =
+                                    if (reanchor != null && capturedMessage.isPermanentlyLocal() &&
+                                        !capturedMessage.isSessionStartMarker()
+                                    ) {
+                                        capturedMessage.copy(localAnchorOrder = reanchor, localPredecessorId = null)
+                                    } else {
+                                        capturedMessage
+                                    }
+                                repo.persistMessage(persisted, capturedSessionId)
+                                if (reanchor != null && persisted !== capturedMessage) {
+                                    _uiState.update { state ->
+                                        if (state.currentSessionId != capturedSessionId) {
+                                            state
+                                        } else {
+                                            state.copy(
+                                                messages =
+                                                    state.messages.map { current ->
+                                                        if (current.id == capturedMessage.id) {
+                                                            current.copy(
+                                                                localAnchorOrder = reanchor,
+                                                                localPredecessorId = null,
+                                                            )
+                                                        } else {
+                                                            current
+                                                        }
+                                                    },
+                                            )
+                                        }
+                                    }
+                                }
+                            }.also { localTranscriptPersistenceTail = it }
+                    } else {
+                        null
+                    }
+                placed to job
+            }
+        // No database access inside the StateFlow transform or append lock.
+        persistenceJob?.start()
+        return placed
+    }
+
     private fun addAssistantMessage(text: String) {
-        val msg =
+        appendLocalTranscriptEvent(
             ChatMessage(
                 role = MessageRole.ASSISTANT,
                 content = text,
-                displayKind = "local_feedback",
-            )
-        _uiState.update { it.copy(messages = it.messages + msg) }
-
-        // Persist — OUTSIDE update{}
-        val sessionId = _uiState.value.currentSessionId
-        if (sessionId != null) {
-            viewModelScope.launch(ioDispatcher) {
-                repo.persistMessage(msg, sessionId)
-            }
-        }
+                displayKind = DisplayKind.LOCAL_FEEDBACK,
+            ),
+        )
     }
 
     private fun handleUndoCommand(count: String) {
@@ -2684,18 +4594,175 @@ class ChatViewModel(
         viewModelScope.launch(ioDispatcher) {
             try {
                 val result =
-                    wsClient
-                        .request(
-                            WsMethods.COMMAND_DISPATCH,
-                            mapOf("name" to "undo", "arg" to count, "session_id" to sessionId),
-                        ).await()
-                handleDispatchResult(result)
+                    wsClient.call(
+                        RpcMethods.COMMAND_DISPATCH,
+                        CommandDispatchParams(name = "undo", arg = count, sessionId = sessionId),
+                    )
+                handleDispatchResult(result.toAny())
             } catch (e: HermesWsClient.HermesRpcException) {
                 addAssistantMessage(e.message ?: "Failed to undo.")
             } catch (e: Exception) {
                 addAssistantMessage(e.message ?: "Failed to undo.")
             }
         }
+    }
+
+    private fun compressSession(focusTopic: String) {
+        val sessionId = _uiState.value.currentSessionId
+        // Fix #1437: session.compress resolves a runtime ID, not the persisted history key.
+        // Keep the stored ID below for generation guards and transcript persistence.
+        val rpcSessionId = runtimeSessionId
+        if (sessionId == null || rpcSessionId == null) {
+            addAssistantMessage("No active session to compress.")
+            return
+        }
+        if (_uiState.value.isCompressing) return
+        val generation = sessionGeneration
+        val current = { isCurrentSessionRequest(sessionId, generation) }
+        _uiState.update { it.copy(isCompressing = true, compressionStatus = "⏳ Compressing context...") }
+        viewModelScope.launch(ioDispatcher) {
+            try {
+                val result =
+                    wsClient.call(
+                        RpcMethods.SESSION_COMPRESS,
+                        SessionCompressParams(
+                            sessionId = rpcSessionId,
+                            focusTopic = focusTopic.takeIf { it.isNotBlank() },
+                        ),
+                        timeoutMs = 300_000L,
+                    )
+                if (current()) handleCompressionResult(result, sessionId, generation)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (current()) addAssistantMessage("/compress: ${e.message ?: "compression failed"}")
+            } finally {
+                if (current()) _uiState.update { it.copy(isCompressing = false, compressionStatus = null) }
+            }
+        }
+    }
+
+    /** Serialize authoritative RPC replacement with local append writes. */
+    private suspend fun applyCompressedHistory(
+        sessionId: String,
+        generation: Long,
+        replacement: List<ChatMessage>,
+    ): Boolean {
+        if (!isCurrentSessionRequest(sessionId, generation)) return false
+        val replacementTail =
+            replacement
+                .mapNotNull { it.canonicalRestId?.substringAfterLast('-')?.toLongOrNull() }
+                .maxOrNull() ?: -1L
+        val barrier =
+            synchronized(localTranscriptAppendLock) {
+                val predecessor = localTranscriptPersistenceTail
+                viewModelScope
+                    .async(ioDispatcher, start = CoroutineStart.LAZY) {
+                        predecessor?.join()
+                        if (!isCurrentSessionRequest(sessionId, generation)) return@async false
+                        val retained = repo.replaceCanonicalHistory(sessionId, replacement)
+                        onCompressionHistoryReplacedForTest?.invoke()
+                        if (!isCurrentSessionRequest(sessionId, generation)) return@async false
+                        val retainedById = retained.associateBy { it.id }
+                        synchronized(localTranscriptAppendLock) {
+                            val nextEpoch = (compressedHistoryEpochs[sessionId]?.first ?: 0L) + 1L
+                            compressedHistoryEpochs[sessionId] = nextEpoch to replacementTail
+                            _uiState.update { state ->
+                                if (!isCurrentSessionRequest(sessionId, generation)) {
+                                    state
+                                } else {
+                                    val visible = state.messages.filter { it.canonicalRestId == null }
+                                    val visibleLocals =
+                                        visible.map { message ->
+                                            retainedById[message.id]?.let { row ->
+                                                message.copy(
+                                                    localAnchorOrder = row.localAnchorOrder,
+                                                    localPredecessorId = row.localPredecessorId,
+                                                )
+                                            } ?: if (message.isPermanentlyLocal() && !message.isSessionStartMarker()) {
+                                                message.copy(
+                                                    localAnchorOrder = replacementTail,
+                                                    localPredecessorId = null,
+                                                )
+                                            } else {
+                                                message
+                                            }
+                                        }
+                                    state.copy(messages = replacement + (visibleLocals + retained).distinctBy { it.id })
+                                }
+                            }
+                        }
+                        true
+                    }.also { localTranscriptPersistenceTail = it }
+            }
+        barrier.start()
+        return barrier.await()
+    }
+
+    private suspend fun handleCompressionResult(
+        result: Any?,
+        sessionId: String,
+        generation: Long,
+    ) {
+        val response =
+            try {
+                OkHttpProvider.json.decodeFromJsonElement<SessionCompressResponse>(result.toJsonElement())
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to decode session.compress response", e)
+                null
+            }
+        if (!isCurrentSessionRequest(sessionId, generation)) return
+        if (response == null ||
+            (response.status != null && response.status !in setOf("ok", "compressed")) ||
+            (
+                response.status == null && response.messages == null && response.summary == null &&
+                    response.message == null && response.compressed == null
+            )
+        ) {
+            throw IllegalStateException("Unrecognized session.compress response; history was not reconciled")
+        }
+        val incompleteFallback = response.messages != null && latestPaging && response.messages.any { it.id == null }
+        if (response.messages != null && !incompleteFallback) {
+            val replacement =
+                withContext(historyDispatcher) {
+                    mapServerMessages(
+                        sessionId = sessionId,
+                        messages = response.messages,
+                        offset = 0,
+                        latestPaging = latestPaging,
+                        liveMessages = emptyList(),
+                        activeReplyTarget = ReplyNotificationTracker.getActiveTarget(getApplication()),
+                        mediaUrl = ::gatewayMediaUrl,
+                    )
+                }
+            if (!applyCompressedHistory(sessionId, generation, replacement)) return
+        } else if (incompleteFallback) {
+            // An id-less latest-page response needs the REST protocol's paging negotiation.
+            // loadSessionMessages starts a child job; joining it is essential before feedback.
+            hydratedGeneration = -1L
+            loadSessionMessages(sessionId, generation).join()
+            if (!isCurrentSessionRequest(sessionId, generation)) return
+        }
+        if (!isCurrentSessionRequest(sessionId, generation)) return
+        val summary = response?.summary
+        val feedback =
+            listOfNotNull(
+                summary?.headline?.takeIf { it.isNotBlank() },
+                summary?.token_line?.takeIf { it.isNotBlank() },
+                summary?.note?.takeIf { it.isNotBlank() },
+            ).takeIf { it.isNotEmpty() }?.joinToString("\n") ?: response?.message ?: "Context compressed."
+        addAssistantMessage(
+            if (incompleteFallback) "$feedback\nHistory refresh incomplete; cached history retained." else feedback,
+        )
+        if (!isCurrentSessionRequest(sessionId, generation)) return
+        fetchContextUsage()
+        loadSessions()
+        if (!isCurrentSessionRequest(sessionId, generation)) return
+        response?.info?.let { infoElement ->
+            val infoMap = (infoElement.toAny() as? Map<*, *>)?.filterKeys { it is String } as? Map<String, Any?>
+            handleSessionInfo(infoMap)
+        }
+        if (isCurrentSessionRequest(sessionId, generation)) sessionHasServerPresence = true
     }
 
     private fun handlePrefillResult(
@@ -2737,12 +4804,38 @@ class ChatViewModel(
 
     fun interruptSession() {
         val sessionId = runtimeSessionId ?: return
+        _uiState.value.currentSessionId?.let { storageId ->
+            sendStore.park(sendScope(), storageId)
+            publishPendingSends()
+        }
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.SESSION_INTERRUPT,
-                mapOf("session_id" to sessionId),
+                RpcMethods.SESSION_INTERRUPT,
+                SessionInterruptParams(sessionId),
                 onSent = { id -> trackRequest(id, WsMethods.SESSION_INTERRUPT) },
             )
+        }
+    }
+
+    /**
+     * `/stop`, matching the desktop app: interrupt the active turn (same path as the composer Stop button), then
+     * kill every background process via `process.stop`. The button stays interrupt-only.
+     */
+    private fun stopSessionAndProcesses() {
+        interruptSession()
+        viewModelScope.launch(ioDispatcher) {
+            val message =
+                try {
+                    val killed = wsClient.call(RpcMethods.PROCESS_STOP, ProcessStopParams).killed ?: 0
+                    when {
+                        killed > 0 -> "Stopped $killed background process${if (killed == 1) "" else "es"}."
+                        else -> "No background processes to stop."
+                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    "Could not stop background processes: ${e.message ?: e.javaClass.simpleName}"
+                }
+            addSystemMessage(message)
         }
     }
 
@@ -2847,8 +4940,8 @@ class ChatViewModel(
         val generation = resetSessionState(sessionId = null, title = "Hermes", isLoading = setLoading)
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.SESSION_CREATE,
-                params = mapOf("source" to "desktop"),
+                RpcMethods.SESSION_CREATE,
+                SessionCreateParams(source = DESKTOP_SESSION_SOURCE),
                 onSent = { id -> trackSessionRequest(id, WsMethods.SESSION_CREATE, generation) },
             )
         }
@@ -2868,7 +4961,8 @@ class ChatViewModel(
     fun loadSessions() {
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.SESSION_LIST,
+                RpcMethods.SESSION_LIST,
+                SessionListParams,
                 onSent = { id -> trackRequest(id, WsMethods.SESSION_LIST) },
             )
         }
@@ -2877,7 +4971,8 @@ class ChatViewModel(
     private fun fetchCommandCatalog() {
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.COMMANDS_CATALOG,
+                RpcMethods.COMMANDS_CATALOG,
+                CommandsCatalogParams,
                 onSent = { id -> trackRequest(id, WsMethods.COMMANDS_CATALOG) },
             )
         }
@@ -2895,6 +4990,7 @@ class ChatViewModel(
         _uiState.update { state ->
             state.copy(
                 typingEffectEnabled = AuthManager.isTypingEffectEnabled(),
+                busySendMode = AuthManager.getBusySendMode(),
                 typingEffectDelayMs = AuthManager.getTypingEffectDelayMs(),
                 messageStatsEnabled = AuthManager.isMessageStatsEnabled(),
                 showUserMessageTokens = AuthManager.isUserMessageTokensEnabled(),
@@ -2903,6 +4999,7 @@ class ChatViewModel(
                 showModelProvider = AuthManager.isModelProviderShown(),
             )
         }
+        publishPendingSends()
     }
 
     /**
@@ -3152,11 +5249,12 @@ class ChatViewModel(
                                         liveMessages = _uiState.value.messages,
                                         isPagingOlder = true,
                                         stableRowIds = true,
-                                        context = getApplication(),
+                                        activeReplyTarget = ReplyNotificationTracker.getActiveTarget(getApplication()),
+                                        mediaUrl = ::gatewayMediaUrl,
                                     )
                                 }
                             if (!valid()) return@launch
-                            val targetId = "rest-$sessionId-$rowId"
+                            val targetId = RestMessageId.of(sessionId, rowId)
                             if (page.none { it.id == targetId || it.canonicalRestId == targetId }) {
                                 _timelineState.update {
                                     it.copy(windowErrorMessage = "The selected prompt is no longer available.")
@@ -3254,19 +5352,152 @@ class ChatViewModel(
     ): List<ChatMessage>? {
         while (isCurrent()) {
             val snapshot = _uiState.value
+            // Receipt bubbles can be absent after rejection/reconnect. Offer their identities
+            // to the canonical matcher without displaying unconfirmed messages again.
+            val visibleIds = snapshot.messages.map { it.id }.toSet()
+            val currentSendScope = sendScope()
+            val receiptRows =
+                sendStore
+                    .all()
+                    .filter { it.scope == currentSendScope && it.sessionId == snapshot.currentSessionId }
+            val receiptsById = receiptRows.associateBy { it.id }
+            val receiptBackedIds =
+                receiptRows
+                    .filter {
+                        it.state in
+                            setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+                    }.mapTo(mutableSetOf()) { it.id }
+            // Fix #1446 follow-up: a restored legacy ACK is not a newly observed live turn.
+            // Placement is independent of delivery proof; retain the exact-only receipt.
+            val restoredAcceptedReceiptIds =
+                receiptRows
+                    .filter { it.state == PendingSendState.ACCEPTED && it.requiresExactReconciliation }
+                    .mapTo(mutableSetOf()) { it.id }
+            val receiptCandidates =
+                if (cached) {
+                    emptyList()
+                } else {
+                    receiptRows
+                        .filter {
+                            it.id !in visibleIds &&
+                                // Do not let an idless uncertain receipt claim a repeated REST row by text.
+                                (
+                                    (it.state != PendingSendState.UNKNOWN && !it.requiresExactReconciliation) ||
+                                        it.userRowId != null
+                                ) &&
+                                it.state in
+                                setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+                        }.map {
+                            ChatMessage(
+                                id = it.id,
+                                role = MessageRole.USER,
+                                content = it.text,
+                                attachments = it.attachments,
+                                timestamp = it.createdAt,
+                                serverRowId = it.userRowId,
+                            )
+                        }
+                }
+            val receiptCandidateIds = receiptCandidates.map { it.id }.toSet()
+            val exactOnlyIds =
+                receiptRows
+                    .filter { it.state == PendingSendState.UNKNOWN || it.requiresExactReconciliation }
+                    .mapTo(mutableSetOf()) { it.id }
+            // A restored, unanchored pending row must not claim an unrelated same-text
+            // canonical occurrence, even when it has no receipt at all.
+            exactOnlyIds.addAll(
+                snapshot.messages
+                    .filter { it.isRestoredUnconfirmed && it.messageProvenance == MessageProvenance.LOCAL_PENDING }
+                    .map { it.id },
+            )
             val computed =
                 withContext(historyDispatcher) {
-                    val page = mapPage(snapshot.messages)
+                    val mapped = mapPage(snapshot.messages)
+                    val currentById = snapshot.messages.associateBy { it.id }
+                    // Durable provenance distinguishes new unsent prompts after process death.
+                    // Legacy UUID-only USER rows remain unconfirmed, but restored placement is
+                    // independent of delivery: UNKNOWN must not pin old prompts after fresh replies.
+                    val page =
+                        if (cached) {
+                            mapped.map { message ->
+                                val receipt = receiptsById[message.id]
+                                val coldPendingOrphan =
+                                    message.role == MessageRole.USER &&
+                                        message.messageProvenance == MessageProvenance.LOCAL_PENDING &&
+                                        message.canonicalRestId == null &&
+                                        message.localAnchorOrder == null &&
+                                        message.localPredecessorId == null &&
+                                        !message.isPermanentlyLocal() &&
+                                        (
+                                            receipt == null ||
+                                                (
+                                                    receipt.state == PendingSendState.ACCEPTED &&
+                                                        receipt.requiresExactReconciliation
+                                                )
+                                        )
+                                message.copy(
+                                    isHistoricalCache =
+                                        when {
+                                            currentById[message.id]?.isHistoricalCache == false -> false
+                                            message.isPermanentlyLocal() -> false
+                                            message.messageProvenance == MessageProvenance.LOCAL_PENDING -> false
+                                            message.canonicalRestId != null -> true
+                                            message.role == MessageRole.USER -> false
+                                            else -> true
+                                        },
+                                    isRestoredUnconfirmed =
+                                        when {
+                                            message.role != MessageRole.USER ||
+                                                message.canonicalRestId != null ||
+                                                message.isPermanentlyLocal() ||
+                                                (
+                                                    message.messageProvenance == MessageProvenance.LOCAL_PENDING &&
+                                                        !coldPendingOrphan
+                                                ) ||
+                                                (
+                                                    message.id in receiptBackedIds &&
+                                                        message.id !in restoredAcceptedReceiptIds
+                                                ) -> {
+                                                false
+                                            }
+
+                                            currentById[message.id] != null -> {
+                                                currentById.getValue(message.id).isRestoredUnconfirmed
+                                            }
+
+                                            else -> {
+                                                true
+                                            }
+                                        },
+                                )
+                            }
+                        } else {
+                            mapped
+                        }
+                    // Protect both incoming and existing candidates in every matching pass,
+                    // including cache-local deduplication when REST arrived first.
+                    val contentMatchExcludedIds =
+                        exactOnlyIds +
+                            page
+                                .filter {
+                                    it.isRestoredUnconfirmed &&
+                                        it.messageProvenance == MessageProvenance.LOCAL_PENDING
+                                }.map { it.id }
                     val merged =
                         if (cached) {
-                            mergeCachedTranscriptPage(page, snapshot.messages)
+                            mergeCachedTranscriptPage(
+                                page,
+                                snapshot.messages,
+                                contentMatchExcludedIds = contentMatchExcludedIds,
+                            )
                         } else {
                             mergeTranscriptWithLive(
                                 page,
-                                snapshot.messages,
+                                snapshot.messages + receiptCandidates,
                                 chronological = !prepend,
                                 preserveLiveIds = true,
-                            )
+                                contentMatchExcludedIds = contentMatchExcludedIds,
+                            ).filterNot { it.id in receiptCandidateIds && it.canonicalRestId == null }
                         }
                     val stableMessages = if (merged == snapshot.messages) snapshot.messages else merged
                     Triple(page, stableMessages, hydrateTodosFromMessages(merged).ifEmpty { snapshot.todos })
@@ -3277,7 +5508,11 @@ class ChatViewModel(
                 applied = isCurrent() && current.messages === snapshot.messages && current.todos === snapshot.todos
                 if (applied) current.copy(messages = computed.second, todos = computed.third) else current
             }
-            if (applied) return computed.first
+            if (applied) {
+                ChatImageDiagnostics.history(snapshot.messages, computed.first, computed.second, cached)
+                if (!cached) releaseUnreferencedSnapshots()
+                return computed.first
+            }
         }
         return null
     }
@@ -3289,6 +5524,9 @@ class ChatViewModel(
     private fun resetTimelineState() {
         timelineJob?.cancel()
         historyWindowJob?.cancel()
+        receiptLookupJob?.cancel()
+        receiptLookupJob = null
+        receiptLookupCursor = 0L
         activeTimelineRequestSequence = ++timelineRequestSequence
         activeHistoryWindowRequestSequence = ++historyWindowRequestSequence
         _timelineState.value = ChatTimelineState()
@@ -3304,7 +5542,22 @@ class ChatViewModel(
         val page = withContext(historyDispatcher) { repo.loadPage(sessionId, before, MESSAGE_PAGE_SIZE) }
         val valid = { isCurrent() && cacheCursor == before }
         if (!valid()) return false
-        mergeHistoryPage(valid, cached = true) { page.messages } ?: return false
+        mergeHistoryPage(valid, cached = true) {
+            // #1432: Room retains host references, not connection-bound download URLs.
+            page.messages.map { message ->
+                if (message.role == MessageRole.USER && message.attachments.isNullOrEmpty()) {
+                    message.copy(
+                        attachments =
+                            userImageAttachments(
+                                message.content,
+                                ::gatewayMediaUrl,
+                            ).takeIf { it.isNotEmpty() },
+                    )
+                } else {
+                    message
+                }
+            }
+        } ?: return false
         if (!valid()) return false
         cacheCursor = page.cursor
         cacheHasOlder = page.hasOlder
@@ -3342,7 +5595,7 @@ class ChatViewModel(
     private fun loadSessionMessages(
         sessionId: String,
         generation: Long,
-    ) {
+    ): Job {
         if (activeHydrationRequestSequence != 0L && cacheJob?.isActive == true) {
             cacheJob?.cancel()
             if (!cacheLoaded) loadCachedMessages(sessionId, generation)
@@ -3350,13 +5603,15 @@ class ChatViewModel(
         val requestSequence = ++hydrationRequestSequence
         activeHydrationRequestSequence = requestSequence
         hydrationJob?.cancel()
+        receiptLookupJob?.cancel()
+        receiptLookupJob = null
         olderJob?.cancel()
         syncJob?.cancel()
         isSyncingMessages = false
         _uiState.update { it.copy(isLoadingOlder = false) }
         val valid = { isCurrentHydration(sessionId, generation, requestSequence) }
-        hydrationJob =
-            viewModelScope.launch {
+        return viewModelScope
+            .launch {
                 try {
                     val latestResult = fetchMessagePage(sessionId, 0, MESSAGE_PAGE_SIZE, order = "latest")
                     if (!valid()) return@launch
@@ -3387,7 +5642,8 @@ class ChatViewModel(
                                         serverOffset,
                                         useLatest,
                                         current,
-                                        context = getApplication(),
+                                        activeReplyTarget = ReplyNotificationTracker.getActiveTarget(getApplication()),
+                                        mediaUrl = ::gatewayMediaUrl,
                                     )
                                 } ?: return@launch
                             persistHistoryPage(page, sessionId)
@@ -3428,17 +5684,19 @@ class ChatViewModel(
                 } finally {
                     if (valid()) _uiState.update { it.copy(isLoading = false) }
                 }
-            }
+            }.also { hydrationJob = it }
     }
 
     private suspend fun persistHistoryPage(
         page: List<ChatMessage>,
         sessionId: String,
     ) {
+        val scope = sendScope()
+        val generation = sessionGeneration
         // A mapped page can reuse a live WS message. Never overwrite its newer persisted
         // version with the snapshot used for mapping; WS owns persistence of those IDs.
         val pageIds = page.mapNotNull { it.canonicalRestId }.toSet()
-        val aliases = _uiState.value.messages.filter { it.restId in pageIds && !it.id.startsWith("rest-") }
+        val aliases = _uiState.value.messages.filter { it.restId in pageIds && !RestMessageId.isRest(it.id) }
         withContext(historyDispatcher) {
             repo.persistMessages(
                 page.mapNotNull { message -> message.canonicalRestId?.let { message.copy(id = it, restId = null) } },
@@ -3446,6 +5704,81 @@ class ChatViewModel(
             )
             repo.confirmIdentities(aliases, sessionId)
         }
+        if (!isCurrentSessionRequest(sessionId, generation) || scope != sendScope()) return
+        val scopedPending =
+            sendStore.all().filter { it.scope == scope && it.sessionId == sessionId }
+        val pageRowIds = page.mapNotNull { it.serverRowId }.toSet()
+        // Canonical rows can prove restored receipts by exact row identity.
+        (
+            pendingSendIdsConfirmedByDurableAliases(aliases + page, scopedPending) +
+                pendingSendIdsConfirmedByRowIds(pageRowIds, scopedPending)
+        ).forEach(::removePendingSend)
+        publishPendingSends()
+        drainPendingQueue()
+        reconcileOlderPendingReceipts(sessionId)
+    }
+
+    /** Confirm acknowledged rows outside the latest page without replacing the visible transcript. */
+    private fun reconcileOlderPendingReceipts(sessionId: String) {
+        if (receiptLookupJob?.isActive == true) return
+        val scope = sendScope()
+        val generation = sessionGeneration
+        val requestSequence = activeHydrationRequestSequence
+        val profile = AuthManager.activeProfileId.value ?: AuthManager.DEFAULT_PROFILE_ID
+        val api = ApiClient.hermesApi
+        val eligibleStates = setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+        val candidates =
+            sendStore.all().filter {
+                it.scope == scope && it.sessionId == sessionId && it.state in eligibleStates &&
+                    it.userRowId != null && it.userRowId in 1L..Int.MAX_VALUE.toLong()
+            }
+        val rowIds = candidates.mapNotNull { it.userRowId }.distinct().sorted()
+        // Rotate a bounded batch so one unavailable old row cannot starve later receipts.
+        val batch =
+            (rowIds.filter { it > receiptLookupCursor } + rowIds.filter { it <= receiptLookupCursor })
+                .take(MAX_PENDING_RECEIPT_LOOKUPS)
+        if (batch.isEmpty()) return
+        val valid = {
+            isCurrentHydration(sessionId, generation, requestSequence) && scope == sendScope()
+        }
+        receiptLookupJob =
+            viewModelScope.launch {
+                for (rowId in batch) {
+                    if (!valid()) return@launch
+                    receiptLookupCursor = rowId
+                    try {
+                        val result =
+                            withContext(ioDispatcher) {
+                                safeApiCall {
+                                    api.getSessionMessagesAround(sessionId, rowId.toInt(), profile, limit = 1)
+                                }
+                            }
+                        if (!valid()) return@launch
+                        if (result !is NetworkResult.Success) continue
+                        val response = result.data
+                        if ((response.session_id != null && response.session_id != sessionId) ||
+                            (response.profile != null && response.profile != profile) ||
+                            (response.pagination.row_id != null && response.pagination.row_id.toLong() != rowId) ||
+                            response.messages.size != 1 ||
+                            response.messages.none { it.id?.toLong() == rowId && it.role == "user" }
+                        ) {
+                            continue
+                        }
+                        // Only retire the captured receipt, not a replacement created during the request.
+                        val proven = candidates.filter { it.userRowId == rowId }
+                        sendStore
+                            .all()
+                            .filter { current ->
+                                current in proven && current.state in eligibleStates
+                            }.forEach { removePendingSend(it.id) }
+                        drainPendingQueue()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Missing/unsupported endpoints and transient failures leave delivery unknown.
+                    }
+                }
+            }
     }
 
     // ── Session resume recovery (desktop parity) ─────────────────────────
@@ -3481,7 +5814,12 @@ class ChatViewModel(
         isLoading: Boolean,
     ): Long {
         val generation = ++sessionGeneration
+        // A slow drain belongs to the old session and must not block the resumed queue.
+        queueDrainJob?.cancel()
+        queueDrainJob = null
         connectionOperationDelegate.reset()
+        mainTurnBusy = false
+        lastMainCompletionAt = 0L
         cancelResumeRetry()
         contextUsageJob?.cancel()
         contextUsageJob = null
@@ -3515,6 +5853,7 @@ class ChatViewModel(
                 currentSessionId = sessionId,
                 chatTitle = title,
                 isAgentTyping = false,
+                isSending = false,
                 isThinking = false,
                 thinkingText = "",
                 isLoading = isLoading,
@@ -3522,6 +5861,8 @@ class ChatViewModel(
                 hasOlderMessages = false,
                 streamingMessage = null,
                 errorMessage = null,
+                replyFailure = null,
+                replyFailureProjection = null,
                 openError = null,
                 clarifyRequest = null,
                 sudoPrompt = null,
@@ -3543,6 +5884,9 @@ class ChatViewModel(
                 contextBreakdown = null,
                 compressionCount = null,
                 sessionUsage = null,
+                // #1433: compaction state belongs to the session being left.
+                isCompressing = false,
+                compressionStatus = null,
                 pendingAttachments = emptyList(),
                 composerTextToRestore = null,
                 reactionKind = null,
@@ -3553,6 +5897,7 @@ class ChatViewModel(
                 pendingPrefillText = null,
             )
         }
+        publishPendingSends()
         return generation
     }
 
@@ -3568,16 +5913,15 @@ class ChatViewModel(
         val connectionCheckpoint = connectionOperationDelegate.resumeCheckpoint()
         val profile = AuthManager.activeProfileId.value
         val params =
-            mutableMapOf<String, Any>(
-                "session_id" to sessionId,
-                "omit_messages" to true,
+            SessionResumeParams(
+                sessionId = sessionId,
+                source = DESKTOP_SESSION_SOURCE,
+                omitMessages = true,
+                profile = profile?.takeIf { it.isNotBlank() },
             )
-        if (!profile.isNullOrBlank()) {
-            params["profile"] = profile
-        }
         viewModelScope.launch(ioDispatcher) {
             wsClient.send(
-                WsMethods.SESSION_RESUME,
+                RpcMethods.SESSION_RESUME,
                 params,
                 onSent = { id ->
                     trackSessionRequest(
@@ -3618,6 +5962,7 @@ class ChatViewModel(
                 isSessionReady = runtimeSessionId != null,
             )
         }
+        drainPendingQueue()
     }
 
     private fun resumeRetryDelayMs(attempt: Int): Long =
@@ -3681,6 +6026,40 @@ class ChatViewModel(
         // until its result lands so the user actually sees it.
         pendingGoneSessionNotice = true
         createNewSession(setLoading = false)
+    }
+
+    /**
+     * Issue #1463: the gateway reclaimed a live runtime (broadcast to every client). Invalidate ONLY the runtime
+     * this chat is bound to: the event must name it explicitly, and a stored id alone never matches, so a newer
+     * runtime already resumed for the same conversation survives a late reclaim. History, drafts and pending-send
+     * receipts are kept; the existing resume error + Retry ([retryResumeSession]) rebinds the stored session.
+     */
+    private fun handleSessionReclaimed(event: WsEvent.SessionReclaimed) {
+        val boundRuntime = runtimeSessionId ?: return
+        if (event.sessionId != boundRuntime) return
+        val current = _uiState.value.currentSessionId
+        if (event.storedSessionId != null && current != null && event.storedSessionId != current) return
+        mainTurnBusy = false
+        runtimeSessionId = null
+        ActiveSessionHolder.clear()
+        resumedGeneration = -1L
+        hydratedGeneration = -1L
+        activeResumeRequestSequence = ++resumeRequestSequence
+        // Late results/errors tied to the reclaimed runtime are rejected as stale.
+        sessionGeneration++
+        queueDrainJob?.cancel()
+        queueDrainJob = null
+        cancelResumeRetry()
+        _uiState.update {
+            it.copy(
+                isSessionReady = false,
+                isLoading = false,
+                isAgentTyping = false,
+                isThinking = false,
+                isResumeRetrying = false,
+                resumeError = "Live session was reclaimed by the server. Retry to reconnect.",
+            )
+        }
     }
 
     private fun handleResumeFailure(
@@ -3828,7 +6207,8 @@ class ChatViewModel(
                                         useLatest,
                                         current,
                                         isPagingOlder = true,
-                                        context = getApplication(),
+                                        activeReplyTarget = ReplyNotificationTracker.getActiveTarget(getApplication()),
+                                        mediaUrl = ::gatewayMediaUrl,
                                     )
                                 } ?: return@launch
                             persistHistoryPage(page, sessionId)
@@ -3871,8 +6251,12 @@ class ChatViewModel(
         if (!sessionHasServerPresence) return
         val state = _uiState.value
         val sessionId = state.currentSessionId ?: return
-        if (isSyncingMessages || hydrationJob?.isActive == true || state.isLoading || state.isLoadingOlder ||
-            state.isAgentTyping || _streamingState.value.streamingMessage != null
+        if (isSyncingMessages ||
+            hydrationJob?.isActive == true ||
+            state.isLoading ||
+            state.isLoadingOlder ||
+            state.isAgentTyping ||
+            _streamingState.value.streamingMessage != null
         ) {
             return
         }
@@ -3880,6 +6264,19 @@ class ChatViewModel(
         val requestSequence = activeHydrationRequestSequence
         val valid = { isCurrentHydration(sessionId, generation, requestSequence) }
         val useLatest = latestPaging
+        // #1427: acceptance alone is normal live UX. Only a completed turn followed by
+        // successful history verification can move its still-unmatched receipts into recovery.
+        // Capture the rows before suspending so a later prompt/retry cannot be quarantined.
+        val completionAt = lastMainCompletionAt
+        val completedTurnEpoch = mainTurnEpoch
+        val unverifiedAccepted =
+            sendStore.all().filter {
+                it.scope == sendScope() &&
+                    it.sessionId == sessionId &&
+                    it.state == PendingSendState.ACCEPTED &&
+                    it.createdAt <= completionAt &&
+                    acceptedTurnEpochById[it.id]?.let { epoch -> epoch <= completedTurnEpoch } == true
+            }
         val nextOffset =
             if (useLatest) {
                 0
@@ -3909,10 +6306,19 @@ class ChatViewModel(
                                     current,
                                     // Sync fetches recent replies, so confirm live completion identities.
                                     isPagingOlder = false,
-                                    context = getApplication(),
+                                    activeReplyTarget = ReplyNotificationTracker.getActiveTarget(getApplication()),
+                                    mediaUrl = ::gatewayMediaUrl,
                                 )
                             } ?: return@launch
                         persistHistoryPage(page, sessionId)
+                        if (valid() && !mainTurnBusy && mainTurnEpoch == completedTurnEpoch) {
+                            unverifiedAccepted.forEach { receipt ->
+                                // A gateway-issued user_row_id means the row is stored: never walk back to UNKNOWN.
+                                if (canDemoteAcceptedReceipt(receipt) && sendStore.all().any { it == receipt }) {
+                                    markPendingSend(receipt.id, PendingSendState.UNKNOWN)
+                                }
+                            }
+                        }
                         // Never derive the older cursor from displayed rows or reset it to this latest page.
                         // Append-only growth shifts from-end offsets toward newer rows: the next older
                         // request may overlap, but stable IDs remove echoes without skipping any history.
@@ -4066,9 +6472,9 @@ class ChatViewModel(
                 if (rpcSessionId != null) {
                     try {
                         val result =
-                            sendRpcAndAwait(
-                                WsMethods.SESSION_CONTEXT_BREAKDOWN,
-                                mapOf("session_id" to rpcSessionId),
+                            wsClient.call(
+                                RpcMethods.SESSION_CONTEXT_BREAKDOWN,
+                                SessionIdParams(rpcSessionId),
                             )
                         coroutineContext.ensureActive()
                         val ctx = parseContextBreakdown(result)
@@ -4105,9 +6511,9 @@ class ChatViewModel(
                     if (!isSwitchPending) {
                         try {
                             val usage =
-                                sendRpcAndAwait(
-                                    WsMethods.SESSION_USAGE,
-                                    mapOf("session_id" to rpcSessionId),
+                                wsClient.call(
+                                    RpcMethods.SESSION_USAGE,
+                                    SessionIdParams(rpcSessionId),
                                 )
                             coroutineContext.ensureActive()
                             val snapshot = parseUsageSnapshot(usage)
@@ -4481,6 +6887,8 @@ class ChatViewModel(
         resumeSequence: Long = 0L,
         sessionId: String? = null,
         connectionCheckpoint: ConnectionResumeCheckpoint? = null,
+        receiptScope: String? = null,
+        receiptAttempt: Int? = null,
     ) {
         sessionRequestById[id] =
             SessionRequest(
@@ -4488,6 +6896,8 @@ class ChatViewModel(
                 resumeSequence = resumeSequence,
                 sessionId = sessionId,
                 connectionCheckpoint = connectionCheckpoint,
+                receiptScope = receiptScope,
+                receiptAttempt = receiptAttempt,
             )
         trackRequest(id, method)
     }
@@ -4508,12 +6918,14 @@ class ChatViewModel(
 
     private fun isStaleSessionRequest(request: SessionRequest): Boolean =
         request.generation != sessionGeneration ||
+            (request.receiptScope != null && request.receiptScope != sendScope()) ||
             (request.sessionId != null && request.sessionId != _uiState.value.currentSessionId) ||
             (request.resumeSequence != 0L && request.resumeSequence != activeResumeRequestSequence)
 
     private fun forgetRequest(id: String) {
         idToMethod.remove(id)
         sessionRequestById.remove(id)
+        branchWholeRequests.remove(id)
     }
 
     // ── Search ────────────────────────────────────────────────────────────

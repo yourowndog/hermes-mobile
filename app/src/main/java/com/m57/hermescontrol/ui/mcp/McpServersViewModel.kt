@@ -2,6 +2,8 @@ package com.m57.hermescontrol.ui.mcp
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.m57.hermescontrol.data.local.AuthManager
+import com.m57.hermescontrol.data.local.DataScope
 import com.m57.hermescontrol.data.local.SwrCache
 import com.m57.hermescontrol.data.model.AddMcpServerRequest
 import com.m57.hermescontrol.data.model.McpCatalogEntry
@@ -11,12 +13,15 @@ import com.m57.hermescontrol.data.model.McpServer
 import com.m57.hermescontrol.data.model.McpServerTestResponse
 import com.m57.hermescontrol.data.model.McpServerToggleRequest
 import com.m57.hermescontrol.data.model.McpServersResponse
+import com.m57.hermescontrol.data.model.replaceMcpEnvValue
 import com.m57.hermescontrol.data.remote.ApiClient
+import com.m57.hermescontrol.data.remote.NetworkError
 import com.m57.hermescontrol.data.remote.NetworkResult
 import com.m57.hermescontrol.data.remote.safeApiCall
 import com.m57.hermescontrol.ui.common.ToastHost
 import com.m57.hermescontrol.ui.common.safeLaunchLoad
 import com.m57.hermescontrol.ui.common.safeLaunchSwrLoad
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -25,11 +30,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import retrofit2.Response
 
 enum class AddServerMode { HTTP, Stdio }
 
+enum class McpTab { INSTALLED, CATALOG }
+
 data class McpServersUiState(
+    val selectedTab: McpTab = McpTab.INSTALLED,
     val isLoading: Boolean = false,
     val servers: List<McpServer> = emptyList(),
     val errorMessage: String? = null,
@@ -66,8 +77,9 @@ data class McpServersUiState(
     val activeOAuthFlow: McpOAuthFlowResponse? = null,
 )
 
-class McpServersViewModel :
-    ViewModel(),
+class McpServersViewModel(
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+) : ViewModel(),
     ToastHost {
     private val _uiState = MutableStateFlow(McpServersUiState())
     val uiState: StateFlow<McpServersUiState> = _uiState.asStateFlow()
@@ -131,6 +143,7 @@ class McpServersViewModel :
     // ── Server toggle ────────────────────────────────────────
 
     fun toggleServer(server: McpServer) {
+        if (server.isPluginOwned || isPluginOwned(server.name)) return
         val originalEnabled = server.enabled
         val targetEnabled = !originalEnabled
 
@@ -145,7 +158,7 @@ class McpServersViewModel :
 
         viewModelScope.launch {
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall {
                         ApiClient.hermesApi.toggleMcpServer(
                             server.name,
@@ -163,7 +176,7 @@ class McpServersViewModel :
                 }
 
                 is NetworkResult.Failure -> {
-                    revertToggle(server.name, originalEnabled, "Failed to toggle server: ${result.error.message}")
+                    revertToggle(server.name, originalEnabled, mutationError(result.error, "Failed to toggle server"))
                 }
             }
         }
@@ -178,7 +191,7 @@ class McpServersViewModel :
                 )
             }
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.testMcpServer(name) }
                 }
             when (result) {
@@ -234,7 +247,7 @@ class McpServersViewModel :
 
             val testJobs =
                 enabledServers.map { server ->
-                    async(Dispatchers.IO) {
+                    async(ioDispatcher) {
                         val res = safeApiCall { ApiClient.hermesApi.testMcpServer(server.name) }
                         server.name to res
                     }
@@ -271,9 +284,10 @@ class McpServersViewModel :
     }
 
     fun deleteServer(name: String) {
+        if (isPluginOwned(name)) return
         viewModelScope.launch {
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.deleteMcpServer(name) }
                 }
             when (result) {
@@ -283,7 +297,7 @@ class McpServersViewModel :
                 }
 
                 is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(toastMessage = "Failed to delete server: ${result.error.message}") }
+                    _uiState.update { it.copy(toastMessage = mutationError(result.error, "Failed to delete server")) }
                 }
             }
         }
@@ -311,7 +325,7 @@ class McpServersViewModel :
         viewModelScope.launch {
             val importJobs =
                 requests.map { req ->
-                    async(Dispatchers.IO) {
+                    async(ioDispatcher) {
                         val result = safeApiCall { ApiClient.hermesApi.addMcpServer(req) }
                         req to result
                     }
@@ -387,7 +401,7 @@ class McpServersViewModel :
         viewModelScope.launch {
             val request = AddServerRequestBuilder.build(state)
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.addMcpServer(request) }
                 }
             when (result) {
@@ -412,7 +426,7 @@ class McpServersViewModel :
                     _uiState.update {
                         it.copy(
                             addingServer = false,
-                            toastMessage = "Failed to add server: ${result.error.message}",
+                            toastMessage = mutationError(result.error, "Failed to add server"),
                         )
                     }
                 }
@@ -423,6 +437,7 @@ class McpServersViewModel :
     // ── Env var editing ──────────────────────────────────────
 
     fun startEditingEnv(server: McpServer) {
+        if (server.isPluginOwned || isPluginOwned(server.name)) return
         _uiState.update { it.copy(editingEnvFor = server.name, envKeyInput = "", envValueInput = "") }
     }
 
@@ -439,6 +454,7 @@ class McpServersViewModel :
     }
 
     fun addEnvVar(serverName: String) {
+        if (isPluginOwned(serverName)) return
         val state = _uiState.value
         val key = state.envKeyInput.trim()
         val value = state.envValueInput.trim()
@@ -446,12 +462,14 @@ class McpServersViewModel :
             _uiState.update { it.copy(toastMessage = "Key is required") }
             return
         }
+        val scope = AuthManager.currentDataScope()
+        val profile = AuthManager.activeProfileId.value
         viewModelScope.launch {
-            val existingEnv = state.servers.find { it.name == serverName }?.env ?: emptyMap()
-            val updatedEnv = existingEnv + (key to value)
             val result =
-                withContext(Dispatchers.IO) {
-                    safeApiCall { ApiClient.hermesApi.updateMcpServer(serverName, mapOf("env" to updatedEnv)) }
+                withContext(ioDispatcher) {
+                    safeApiCall(retries = 0) {
+                        updateServerEnv(serverName, key, value, scope, profile)
+                    }
                 }
             when (result) {
                 is NetworkResult.Success -> {
@@ -466,7 +484,7 @@ class McpServersViewModel :
                 }
 
                 is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(toastMessage = "Failed to add env var: ${result.error.message}") }
+                    _uiState.update { it.copy(toastMessage = mutationError(result.error, "Failed to add env var")) }
                 }
             }
         }
@@ -476,13 +494,15 @@ class McpServersViewModel :
         serverName: String,
         key: String,
     ) {
+        if (isPluginOwned(serverName)) return
+        val scope = AuthManager.currentDataScope()
+        val profile = AuthManager.activeProfileId.value
         viewModelScope.launch {
-            val state = _uiState.value
-            val existingEnv = state.servers.find { it.name == serverName }?.env ?: emptyMap()
-            val updatedEnv = existingEnv - key
             val result =
-                withContext(Dispatchers.IO) {
-                    safeApiCall { ApiClient.hermesApi.updateMcpServer(serverName, mapOf("env" to updatedEnv)) }
+                withContext(ioDispatcher) {
+                    safeApiCall(retries = 0) {
+                        updateServerEnv(serverName, key, null, scope, profile)
+                    }
                 }
             when (result) {
                 is NetworkResult.Success -> {
@@ -491,7 +511,7 @@ class McpServersViewModel :
                 }
 
                 is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(toastMessage = "Failed to remove env var: ${result.error.message}") }
+                    _uiState.update { it.copy(toastMessage = mutationError(result.error, "Failed to remove env var")) }
                 }
             }
         }
@@ -499,11 +519,41 @@ class McpServersViewModel :
 
     // ── Catalog ──────────────────────────────────────────────
 
+    // #1469: the dashboard only supports replacing the complete saved MCP map.
+    private val envMutationMutex = Mutex()
+
+    private suspend fun updateServerEnv(
+        serverName: String,
+        key: String,
+        value: String?,
+        scope: DataScope?,
+        profile: String?,
+    ): Response<Unit> =
+        envMutationMutex.withLock {
+            check(AuthManager.currentDataScope() == scope && AuthManager.activeProfileId.value == profile) {
+                "Server or profile changed; retry this edit in the selected profile"
+            }
+            val api = ApiClient.hermesApi
+            val saved = api.getSavedConfig(profile)
+            if (!saved.isSuccessful) {
+                return@withLock Response.error(
+                    saved.code(),
+                    saved.errorBody() ?: error("Could not read saved MCP configuration"),
+                )
+            }
+            val config = saved.body() ?: error("Saved MCP configuration is empty")
+            val replacement = replaceMcpEnvValue(config, serverName, key, value, profile)
+            check(
+                AuthManager.currentDataScope() == scope && AuthManager.activeProfileId.value == profile,
+            ) { "Server or profile changed; retry this edit in the selected profile" }
+            api.replaceMcpServers(replacement)
+        }
+
     fun loadCatalog() {
         _uiState.update { it.copy(catalogLoading = true, catalogError = null) }
         viewModelScope.launch {
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.getMcpCatalog() }
                 }
             when (result) {
@@ -528,6 +578,14 @@ class McpServersViewModel :
         }
     }
 
+    fun setTab(tab: McpTab) {
+        _uiState.update { it.copy(selectedTab = tab) }
+        val s = _uiState.value
+        if (tab == McpTab.CATALOG && s.catalogEntries.isEmpty() && !s.catalogLoading) {
+            loadCatalog()
+        }
+    }
+
     fun updateCatalogQuery(v: String) {
         _uiState.update { it.copy(catalogQuery = v) }
     }
@@ -542,7 +600,7 @@ class McpServersViewModel :
                     env = state.catalogInstallEnv.ifEmpty { null },
                 )
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.installMcpCatalogEntry(request) }
                 }
             when (result) {
@@ -555,6 +613,7 @@ class McpServersViewModel :
                         )
                     }
                     loadServers(forceRefresh = true)
+                    loadCatalog()
                 }
 
                 is NetworkResult.Failure -> {
@@ -584,11 +643,12 @@ class McpServersViewModel :
         server: McpServer,
         onOpenBrowser: (String) -> Unit,
     ) {
+        if (server.isPluginOwned || isPluginOwned(server.name)) return
         oauthPollJob?.cancel()
         _uiState.update { it.copy(toastMessage = "Starting OAuth authorization…") }
         viewModelScope.launch {
             val result =
-                withContext(Dispatchers.IO) {
+                withContext(ioDispatcher) {
                     safeApiCall { ApiClient.hermesApi.authMcpServer(server.name) }
                 }
             when (result) {
@@ -608,7 +668,7 @@ class McpServersViewModel :
                 }
 
                 is NetworkResult.Failure -> {
-                    _uiState.update { it.copy(toastMessage = "Failed to start OAuth: ${result.error.message}") }
+                    _uiState.update { it.copy(toastMessage = mutationError(result.error, "Failed to start OAuth")) }
                 }
             }
         }
@@ -623,7 +683,7 @@ class McpServersViewModel :
                 while (polling) {
                     kotlinx.coroutines.delay(2000)
                     val result =
-                        withContext(Dispatchers.IO) {
+                        withContext(ioDispatcher) {
                             safeApiCall { ApiClient.hermesApi.getMcpOAuthFlowStatus(flowId) }
                         }
                     when (result) {
@@ -687,6 +747,15 @@ class McpServersViewModel :
     }
 
     // ── Helpers ──────────────────────────────────────────────
+
+    // #1283: re-check current ownership so stale row callbacks cannot mutate a plugin server.
+    private fun isPluginOwned(name: String): Boolean =
+        _uiState.value.servers.any { it.name == name && it.isPluginOwned }
+
+    private fun mutationError(
+        error: NetworkError,
+        prefix: String,
+    ): String = if (error is NetworkError.Http && error.code == 409) error.message else "$prefix: ${error.message}"
 
     private fun revertToggle(
         name: String,

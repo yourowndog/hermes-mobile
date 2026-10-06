@@ -31,7 +31,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
+import com.m57.hermescontrol.ThemeMarketplaceScreen
+import com.m57.hermescontrol.data.theme.import.ThemeApplier
+import com.m57.hermescontrol.theme.ThemePreset
 import com.m57.hermescontrol.ui.common.HermesScaffold
 import com.m57.hermescontrol.ui.common.NavIcon
 import com.m57.hermescontrol.ui.settings.components.AboutSection
@@ -60,6 +64,8 @@ import com.m57.hermescontrol.ui.settings.components.VaultUnlockDialog
 internal fun SettingsConnectionPage(
     onBack: () -> Unit,
     onLogout: () -> Unit,
+    onOpenDrawer: (() -> Unit)? = null,
+    showLogout: Boolean = true,
     viewModel: SettingsViewModel = viewModel { SettingsViewModel() },
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -67,10 +73,9 @@ internal fun SettingsConnectionPage(
 
     HermesScaffold(
         title = { Text(stringResource(R.string.settings_sec_connection)) },
-        navigationIcon = NavIcon.Back(onBack),
-        // Non-primary drill-down: opt out of drawer gestures so the scrim can't
-        // get stuck open (issue #619). DrawerGestureController handles the close.
-        drawerGesturesEnabled = false,
+        navigationIcon = onOpenDrawer?.let { NavIcon.Menu(it) } ?: NavIcon.Back(onBack),
+        // Global Connections enables drawer navigation; settings drill-down disables it (issue #619).
+        drawerGesturesEnabled = onOpenDrawer != null,
     ) {
         Column(
             modifier =
@@ -93,20 +98,31 @@ internal fun SettingsConnectionPage(
                 onTest = viewModel::testConnection,
             )
 
-            Spacer(modifier = Modifier.height(2.dp))
-
-            Button(
+            androidx.compose.material3.OutlinedButton(
                 onClick = {
-                    viewModel.logout()
-                    onLogout()
+                    com.m57.hermescontrol.NavigationController.navigateTo(
+                        com.m57.hermescontrol.ClientCertificatesScreen,
+                    )
                 },
                 modifier = Modifier.fillMaxWidth(),
-                colors =
-                    ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                    ),
-            ) {
-                Text(stringResource(R.string.settings_logout))
+            ) { Text(stringResource(R.string.mtls_title)) }
+
+            Spacer(modifier = Modifier.height(2.dp))
+
+            if (showLogout) {
+                Button(
+                    onClick = {
+                        viewModel.logout()
+                        onLogout()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors =
+                        ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.error,
+                        ),
+                ) {
+                    Text(stringResource(R.string.settings_logout))
+                }
             }
         }
     }
@@ -118,6 +134,8 @@ internal fun SettingsAppearancePage(
     viewModel: SettingsViewModel = viewModel { SettingsViewModel() },
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
+    val restoreFailed by ThemeApplier.restoreFailed.collectAsStateWithLifecycle()
+    val unavailableThemeName by ThemeApplier.unavailableThemeName.collectAsStateWithLifecycle()
 
     HermesScaffold(
         title = { Text(stringResource(R.string.settings_sec_appearance)) },
@@ -139,6 +157,14 @@ internal fun SettingsAppearancePage(
                 onUseDynamicColorsChange = viewModel::onUseDynamicColorsChange,
                 themePreset = state.themePreset,
                 onThemePresetChange = viewModel::onThemePresetChange,
+                chatFontFamily = state.chatFontFamily,
+                onChatFontFamilyChange = viewModel::onChatFontFamilyChange,
+                // CUSTOM + a recorded restore failure = the import did not
+                // survive, so Theme.kt is silently showing Default.
+                customThemeUnavailable = state.themePreset == ThemePreset.CUSTOM && restoreFailed,
+                unavailableThemeName = unavailableThemeName,
+                onReapplyCustomTheme = { NavigationController.navigateTo(ThemeMarketplaceScreen) },
+                onClearCustomTheme = { ThemeApplier.clearCustomTheme() },
             )
         }
     }
@@ -193,6 +219,8 @@ internal fun SettingsChatPage(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             ChatSection(
+                busySendMode = state.busySendMode,
+                onBusySendModeChange = viewModel::onBusySendModeChange,
                 typingEffectEnabled = state.typingEffectEnabled,
                 onTypingEffectEnabledChange = viewModel::onTypingEffectEnabledChange,
                 typingEffectDelayMs = state.typingEffectDelayMs,
@@ -239,6 +267,8 @@ internal fun SettingsBehaviorPage(
                 onAutoReconnectChange = viewModel::onAutoReconnectChange,
                 keepConnectedInBackground = state.keepConnectedInBackground,
                 onKeepConnectedInBackgroundChange = viewModel::onKeepConnectedInBackgroundChange,
+                notifySessionCompletions = state.notifySessionCompletions,
+                onNotifySessionCompletionsChange = viewModel::onNotifySessionCompletionsChange,
                 restoreLastSession = state.restoreLastSession,
                 onRestoreLastSessionChange = viewModel::onRestoreLastSessionChange,
             )

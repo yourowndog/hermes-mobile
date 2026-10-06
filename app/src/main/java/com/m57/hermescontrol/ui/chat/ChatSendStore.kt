@@ -1,0 +1,211 @@
+package com.m57.hermescontrol.ui.chat
+
+import android.content.Context
+import android.content.SharedPreferences
+import com.m57.hermescontrol.data.model.Attachment
+import com.m57.hermescontrol.data.model.BusySendMode
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+
+/** The receipt stays on device until REST confirms a user row; a gateway queue is only volatile. */
+@Serializable
+data class PendingSend(
+    val id: String,
+    val scope: String,
+    val sessionId: String,
+    val text: String,
+    val attachments: List<Attachment> = emptyList(),
+    val mode: BusySendMode,
+    val state: PendingSendState = PendingSendState.QUEUED,
+    val createdAt: Long = System.currentTimeMillis(),
+    val attempts: Int = 0,
+    /** Legacy source URIs are retained for an explicit user retry, never auto-dispatched. */
+    val requiresAttachmentRecovery: Boolean = false,
+    /** `prompt.submit` `user_row_id` receipt (#1285); null means unproven, not rejected. */
+    val userRowId: Long? = null,
+    /** Restore and reconnect require exact REST identity, never inferred text. */
+    val requiresExactReconciliation: Boolean = false,
+    /** Local acknowledgment is not proof of delivery and never gates queue draining. */
+    val userOrderingReleased: Boolean = false,
+)
+
+@Serializable
+enum class PendingSendState {
+    QUEUED,
+    PARKED,
+    SENDING,
+    ACCEPTED,
+    UNKNOWN,
+    REJECTED,
+}
+
+/**
+ * Reconcile only identities that the transcript merge already mapped to a durable REST row.
+ * Content matching belongs to [matchTranscriptMessages], which normalizes gateway wrappers and
+ * consumes duplicate occurrences once; repeating that matching against receipts can acknowledge
+ * more sends than the history page actually contains.
+ */
+internal fun pendingSendIdsConfirmedByDurableAliases(
+    confirmedAliases: List<ChatMessage>,
+    pending: List<PendingSend>,
+): Set<String> {
+    val durableUserRows =
+        confirmedAliases
+            .asSequence()
+            .filter { it.role == MessageRole.USER && it.canonicalRestId != null }
+            .toList()
+    val durableUserAliasIds = durableUserRows.mapTo(mutableSetOf()) { it.id }
+    // A canonical cache row may own the REST identity instead of the missing optimistic UUID.
+    // Only an exact server receipt can bridge that gap; same text is not proof of delivery.
+    val durableUserRowIds = durableUserRows.mapNotNullTo(mutableSetOf()) { it.serverRowId }
+    return pending
+        .asSequence()
+        .filter {
+            it.state in
+                setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+        }.filter {
+            // Never allow a content alias to override an exact receipt or idless UNKNOWN.
+            if (it.userRowId != null) {
+                it.userRowId in durableUserRowIds
+            } else {
+                it.state != PendingSendState.UNKNOWN && !it.requiresExactReconciliation && it.id in durableUserAliasIds
+            }
+        }.map { it.id }
+        .toSet()
+}
+
+/**
+ * #1427: the `prompt.submit` `user_row_id` is the exact gateway row for that send, so a history
+ * page containing it proves delivery even when the merge could not alias the local bubble.
+ */
+internal fun pendingSendIdsConfirmedByRowIds(
+    pageRowIds: Set<Long>,
+    pending: List<PendingSend>,
+): Set<String> =
+    pending
+        .asSequence()
+        .filter {
+            it.state in setOf(PendingSendState.SENDING, PendingSendState.ACCEPTED, PendingSendState.UNKNOWN)
+        }.filter { it.userRowId != null && it.userRowId in pageRowIds }
+        .map { it.id }
+        .toSet()
+
+/** #1427: a receipt holding a gateway `user_row_id` is stored server-side and must never become UNKNOWN. */
+internal fun canDemoteAcceptedReceipt(receipt: PendingSend): Boolean = receipt.userRowId == null
+
+/** Synchronous writes keep the queue recoverable when Android kills the process just after a tap. */
+class ChatSendStore(
+    private val prefs: SharedPreferences? = null,
+) {
+    constructor(context: Context) : this(
+        context.applicationContext.getSharedPreferences("chat_send_outbox", Context.MODE_PRIVATE),
+    )
+
+    private val json = Json { ignoreUnknownKeys = true }
+    private var rows: List<PendingSend> =
+        prefs?.getString("rows", null)?.let { raw ->
+            runCatching { json.decodeFromString<List<PendingSend>>(raw) }.getOrDefault(emptyList())
+        } ?: emptyList()
+
+    init {
+        // A request may have reached the gateway before process death. Never replay it automatically.
+        replace(
+            rows.map {
+                it.quarantineLegacyAttachments().let { quarantined ->
+                    when (quarantined.state) {
+                        PendingSendState.SENDING -> quarantined.copy(state = PendingSendState.UNKNOWN)
+                        PendingSendState.ACCEPTED -> quarantined.copy(requiresExactReconciliation = true)
+                        else -> quarantined
+                    }
+                }
+            },
+        )
+    }
+
+    private fun PendingSend.quarantineLegacyAttachments(): PendingSend =
+        if (attachments.any { !it.uri.startsWith("file:", ignoreCase = true) }) {
+            copy(state = PendingSendState.REJECTED, requiresAttachmentRecovery = true)
+        } else {
+            this
+        }
+
+    @Synchronized
+    fun all(): List<PendingSend> = rows
+
+    @Synchronized
+    fun put(row: PendingSend) {
+        replace(rows.filterNot { it.id == row.id } + row.quarantineLegacyAttachments())
+    }
+
+    @Synchronized
+    fun remove(id: String) {
+        replace(rows.filterNot { it.id == id })
+    }
+
+    @Synchronized
+    fun update(
+        id: String,
+        transform: (PendingSend) -> PendingSend,
+    ) {
+        replace(rows.map { if (it.id == id) transform(it) else it })
+    }
+
+    /** Compare the entire captured receipt; a stale UI snapshot must not remove a changed send. */
+    @Synchronized
+    fun dismissReleasedUnknown(snapshot: PendingSend): Boolean {
+        if (snapshot.state != PendingSendState.UNKNOWN || !snapshot.userOrderingReleased) return false
+        if (rows.firstOrNull { it.id == snapshot.id } != snapshot) return false
+        replace(rows.filterNot { it.id == snapshot.id })
+        return true
+    }
+
+    @Synchronized
+    fun promote(id: String) {
+        val row = rows.firstOrNull { it.id == id } ?: return
+        replace(
+            listOf(row.copy(state = PendingSendState.QUEUED, userOrderingReleased = false)) +
+                rows.filterNot { it.id == id },
+        )
+    }
+
+    @Synchronized
+    fun park(
+        scope: String,
+        sessionId: String,
+    ) {
+        replace(
+            rows.map {
+                if (it.scope == scope && it.sessionId == sessionId && it.state == PendingSendState.QUEUED) {
+                    it.copy(state = PendingSendState.PARKED)
+                } else {
+                    it
+                }
+            },
+        )
+    }
+
+    private fun replace(next: List<PendingSend>) {
+        if (prefs != null && !prefs.edit().putString("rows", json.encodeToString(next)).commit()) {
+            error("Could not save chat send queue")
+        }
+        rows = next
+    }
+}
+
+/** #1427: uncertain receipt bubbles live in recovery UI, not after their server transcript counterpart. */
+internal fun messagesWithoutUnconfirmedReceipts(
+    messages: List<ChatMessage>,
+    pending: List<PendingSend>,
+): List<ChatMessage> {
+    val recoveryIds =
+        pending
+            .filter {
+                it.state == PendingSendState.UNKNOWN || it.state == PendingSendState.REJECTED
+            }.mapTo(mutableSetOf()) { it.id }
+    if (recoveryIds.isEmpty()) return messages
+    return messages.filterNot { it.id in recoveryIds && it.canonicalRestId == null }
+}
+
+/** #1427: normal submission/acceptance stays in the transcript, not in recovery. */
+internal val PendingSend.needsRecovery: Boolean
+    get() = state != PendingSendState.SENDING && state != PendingSendState.ACCEPTED

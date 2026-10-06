@@ -151,6 +151,8 @@ internal class TranscriptComparison(
         b: ChatMessage,
     ): Boolean {
         if (a.role != b.role) return false
+        // #1285: two proven row ids decide identity; a missing one is unproven, so fall through.
+        if (a.serverRowId != null && b.serverRowId != null) return a.serverRowId == b.serverRowId
         val aRestId = a.canonicalRestId
         val bRestId = b.canonicalRestId
         if (aRestId != null && bRestId != null) return aRestId == bRestId
@@ -172,12 +174,12 @@ internal class TranscriptComparison(
         // Rows generated only by Mobile never have a canonical REST counterpart.
         // Do not let coincidentally identical server text claim their identity.
         if (a.role == MessageRole.ASSISTANT &&
-            (a.displayKind == "local_feedback" || b.displayKind == "local_feedback")
+            (a.displayKind == DisplayKind.LOCAL_FEEDBACK || b.displayKind == DisplayKind.LOCAL_FEEDBACK)
         ) {
             return false
         }
         if (a.role == MessageRole.USER &&
-            (a.displayKind == "clarify_response" || b.displayKind == "clarify_response")
+            (a.displayKind == DisplayKind.CLARIFY_RESPONSE || b.displayKind == DisplayKind.CLARIFY_RESPONSE)
         ) {
             return false
         }
@@ -185,12 +187,23 @@ internal class TranscriptComparison(
         val tb = trimmed.getOrPut(b.content) { b.content.trim() }
         if (a.role == MessageRole.USER && (ta.startsWith("/") || tb.startsWith("/"))) return false
         if (ta == tb) return true
+        if (a.role == MessageRole.ASSISTANT &&
+            (a.completionId != null || b.completionId != null) &&
+            a.completionId == b.completionId &&
+            ta.isNotBlank() && tb.isNotBlank() &&
+            ChatVerifierFooter.matchesBase(ta, tb)
+        ) {
+            return true
+        }
         if (a.role == MessageRole.USER &&
             captions.getOrPut(ta) { stripAttachmentRefLines(ta) } ==
             captions.getOrPut(tb) { stripAttachmentRefLines(tb) }
         ) {
             return true
         }
+        // #842 / #1335: prefix drift only exists for sealed assistant narration; two REST
+        // rows already returned above, so user rows must never collapse by prefix.
+        if (a.role != MessageRole.ASSISTANT) return false
         return ta.length >= 40 && tb.length >= 40 && (tb.startsWith(ta) || ta.startsWith(tb))
     }
 }
@@ -201,14 +214,25 @@ internal fun matchTranscriptMessages(
     existing: List<ChatMessage>,
     comparison: TranscriptComparison = TranscriptComparison(),
     allowAssistantContentMatches: Boolean = true,
+    contentMatchExcludedIds: Set<String> = emptySet(),
 ): List<ChatMessage?> {
     val byId = existing.withIndex().associate { it.value.id to it.index }
     val byRestId =
         existing.withIndex().mapNotNull { (index, message) -> message.canonicalRestId?.let { it to index } }.toMap()
+    val byRowId =
+        existing
+            .withIndex()
+            .mapNotNull { (index, message) ->
+                message.serverRowId?.let { (message.role to it) to index }
+            }.toMap()
     val used = BooleanArray(existing.size)
     val matches = arrayOfNulls<ChatMessage>(incoming.size)
     incoming.forEachIndexed { index, message ->
-        (byId[message.id] ?: message.canonicalRestId?.let { byRestId[it] })?.let { match ->
+        (
+            byId[message.id]
+                ?: message.canonicalRestId?.let { byRestId[it] }
+                ?: message.serverRowId?.let { byRowId[message.role to it] }
+        )?.let { match ->
             if (!used[match]) {
                 used[match] = true
                 matches[index] = existing[match]
@@ -244,20 +268,78 @@ internal fun matchTranscriptMessages(
             candidates.firstOrNull { candidate ->
                 val other = existing[candidate]
                 !used[candidate] &&
+                    other.id !in contentMatchExcludedIds &&
+                    message.id !in contentMatchExcludedIds &&
                     (
                         allowAssistantContentMatches || message.role != MessageRole.ASSISTANT ||
                             message.completionId != null || other.completionId != null
                     ) &&
                     // Distinct IDs within the same source are separate occurrences, not echoes.
                     ((message.canonicalRestId == null) != (other.canonicalRestId == null)) &&
-                    comparison.same(message, other)
+                    (
+                        comparison.same(message, other) ||
+                            (
+                                allowAssistantContentMatches &&
+                                    message.role == MessageRole.ASSISTANT &&
+                                    message.content.isNotBlank() && other.content.isNotBlank() &&
+                                    message.completionId != null &&
+                                    message.completionId == other.completionId &&
+                                    ChatVerifierFooter.matchesBase(message.content, other.content)
+                            )
+                    )
             }
         if (match != null) {
             used[match] = true
             matches[index] = existing[match]
         }
     }
+    matchRewrittenUserRows(incoming, existing, comparison, used, matches)
     return matches.toList()
+}
+
+/** Clock skew between phone and gateway plus send latency; a rewritten row keeps its original timestamp. */
+private const val REWRITTEN_ROW_WINDOW_MS = 120_000L
+
+/**
+ * #1491: compaction re-issues gateway row ids, so a restored local USER row can no longer match its
+ * canonical copy by id. Fold the pair only when it is unambiguous: same text, timestamps inside
+ * [REWRITTEN_ROW_WINDOW_MS], and exactly one candidate on each side. Repeated prompts stay separate.
+ */
+private fun matchRewrittenUserRows(
+    incoming: List<ChatMessage>,
+    existing: List<ChatMessage>,
+    comparison: TranscriptComparison,
+    used: BooleanArray,
+    matches: Array<ChatMessage?>,
+) {
+    fun sameText(
+        a: ChatMessage,
+        b: ChatMessage,
+    ) = a.role == MessageRole.USER && b.role == MessageRole.USER &&
+        a.displayKind != DisplayKind.CLARIFY_RESPONSE && b.displayKind != DisplayKind.CLARIFY_RESPONSE &&
+        !a.isPermanentlyLocal() && !b.isPermanentlyLocal() && a.content.isNotBlank() &&
+        comparison.same(a.copy(restId = null, serverRowId = null), b.copy(restId = null, serverRowId = null)) &&
+        kotlin.math.abs(a.timestamp - b.timestamp) <= REWRITTEN_ROW_WINDOW_MS
+
+    val restored =
+        existing.indices.filter {
+            !used[it] && existing[it].isRestoredUnconfirmed && existing[it].role == MessageRole.USER
+        }
+    if (restored.isEmpty()) return
+    val open =
+        incoming.indices.filter {
+            matches[it] == null && incoming[it].role == MessageRole.USER && incoming[it].canonicalRestId != null
+        }
+    for (candidate in restored) {
+        val hits = open.filter { matches[it] == null && sameText(incoming[it], existing[candidate]) }
+        val single = hits.singleOrNull() ?: continue
+        val rivals = restored.count { !used[it] && sameText(incoming[single], existing[it]) }
+        val incomingRivals = open.count { matches[it] == null && sameText(incoming[it], existing[candidate]) }
+        if (rivals == 1 && incomingRivals == 1) {
+            used[candidate] = true
+            matches[single] = existing[candidate]
+        }
+    }
 }
 
 /**
@@ -288,13 +370,17 @@ internal fun stripAttachmentRefLines(content: String): String =
 internal fun dedupeCachedMessages(
     messages: List<ChatMessage>,
     confirmedOnly: Boolean = false,
+    contentMatchExcludedIds: Set<String> = emptySet(),
 ): List<ChatMessage> {
     val unique = messages.dedupeById()
-    val rest = unique.filter { it.id.startsWith("rest-") }
-    val live = unique.filterNot { it.id.startsWith("rest-") }
+    val rest = unique.filter { RestMessageId.isRest(it.id) }
+    val live = unique.filterNot { RestMessageId.isRest(it.id) }
     if (rest.isEmpty() || live.isEmpty()) return unique
     val matches =
-        matchTranscriptMessages(rest, live).mapIndexed { index, match ->
+        matchTranscriptMessages(rest, live, contentMatchExcludedIds = contentMatchExcludedIds).mapIndexed {
+            index,
+            match,
+            ->
             match?.takeIf {
                 !confirmedOnly || rest[index].canonicalRestId == it.canonicalRestId ||
                     (rest[index].completionId != null && rest[index].completionId == it.completionId)
@@ -313,10 +399,22 @@ internal fun dedupeCachedMessages(
             }.toMap()
     return unique.filterNot { it.id in echoes }.map { message ->
         aliases[message.id]?.let {
+            // #1459: the caption-only UUID alias must not outlive the REST twin that carries its image.
+            val images =
+                if (message.role == MessageRole.USER) {
+                    reconcileUserImages(message.attachments, message.content, it.attachments, it.content)
+                } else {
+                    null
+                }
             message.copy(
+                attachments = images?.attachments ?: message.attachments,
+                content = images?.content ?: message.content,
                 restId = it.canonicalRestId,
+                serverRowId = message.serverRowId ?: it.serverRowId,
+                reactions = it.reactions.ifEmpty { message.reactions },
                 completionId = message.completionId ?: it.completionId,
                 displayKind = message.displayKind ?: it.displayKind,
+                isRestoredUnconfirmed = false,
             )
         } ?: message
     }
@@ -326,6 +424,7 @@ internal fun dedupeCachedMessages(
 internal fun mergeCachedTranscriptPage(
     page: List<ChatMessage>,
     current: List<ChatMessage>,
+    contentMatchExcludedIds: Set<String> = emptySet(),
 ): List<ChatMessage> {
     val currentById = current.associateBy { it.id }
     // Legacy cached UUIDs may lack an alias. Restore a known alias before page-local matching
@@ -335,19 +434,89 @@ internal fun mergeCachedTranscriptPage(
             page.map { message ->
                 currentById[message.id]?.restId?.let { message.copy(restId = it) } ?: message
             },
+            contentMatchExcludedIds = contentMatchExcludedIds,
         )
-    val matches = matchTranscriptMessages(incoming, current)
+    val matches = matchTranscriptMessages(incoming, current, contentMatchExcludedIds = contentMatchExcludedIds)
     val replacements =
         incoming
             .mapIndexedNotNull { index, message ->
                 val match = matches[index] ?: return@mapIndexedNotNull null
-                val rich = if (match.id.startsWith("rest-") && !message.id.startsWith("rest-")) message else match
+                val preservedContent =
+                    if (match.role == MessageRole.ASSISTANT &&
+                        ChatVerifierFooter.split(match.content) != null &&
+                        ChatVerifierFooter.matchesBase(match.content, message.content)
+                    ) {
+                        match.content
+                    } else if (message.role == MessageRole.ASSISTANT &&
+                        ChatVerifierFooter.split(message.content) != null &&
+                        ChatVerifierFooter.matchesBase(message.content, match.content)
+                    ) {
+                        message.content
+                    } else {
+                        null
+                    }
+                val rich =
+                    when {
+                        // A late historical snapshot may contribute safe metadata, but it must
+                        // never replace a canonical server payload/status already on screen.
+                        message.isHistoricalCache && match.canonicalRestId != null -> {
+                            match.copy(
+                                toolName = match.toolName ?: message.toolName,
+                                toolCallId = match.toolCallId.ifBlank { message.toolCallId },
+                                attachments = match.attachments ?: message.attachments,
+                                finishTimestamp = match.finishTimestamp ?: message.finishTimestamp,
+                                tokenCount = match.tokenCount ?: message.tokenCount,
+                                tps = match.tps ?: message.tps,
+                            )
+                        }
+
+                        RestMessageId.isRest(match.id) && !RestMessageId.isRest(message.id) -> {
+                            message
+                        }
+
+                        else -> {
+                            match
+                        }
+                    }
+                // A scoped cache refresh may have resolved a predecessor outside this page.
+                // Accept that progression once; an older unresolved snapshot cannot demote it again.
+                val placement =
+                    if (message.localAnchorOrder != null &&
+                        (
+                            match.localAnchorOrder == null ||
+                                (match.localPredecessorId != null && message.localPredecessorId == null)
+                        )
+                    ) {
+                        message
+                    } else {
+                        match
+                    }
+                val userImages =
+                    if (rich.role == MessageRole.USER) {
+                        reconcileUserImages(
+                            rich.attachments,
+                            preservedContent ?: rich.content,
+                            message.attachments,
+                            message.content,
+                        )
+                    } else {
+                        null
+                    }
                 match.id to
                     rich.copy(
                         id = match.id,
-                        restId = message.canonicalRestId ?: match.canonicalRestId,
+                        attachments = userImages?.attachments ?: rich.attachments,
+                        content = userImages?.content ?: preservedContent ?: rich.content,
+                        restId = match.canonicalRestId ?: message.canonicalRestId,
+                        serverRowId = match.serverRowId ?: message.serverRowId,
+                        reactions = message.reactions.ifEmpty { match.reactions },
                         completionId = match.completionId ?: message.completionId,
-                        displayKind = message.displayKind ?: match.displayKind,
+                        displayKind = match.displayKind ?: message.displayKind,
+                        localAnchorOrder = placement.localAnchorOrder,
+                        localPredecessorId = placement.localPredecessorId,
+                        isRestoredUnconfirmed =
+                            match.isRestoredUnconfirmed && message.isRestoredUnconfirmed &&
+                                match.canonicalRestId == null && message.canonicalRestId == null,
                     )
             }.toMap()
     val resolvedOrders =
@@ -367,10 +536,17 @@ internal fun mergeTranscriptWithLive(
     currentMessages: List<ChatMessage>,
     chronological: Boolean = true,
     preserveLiveIds: Boolean = false,
+    contentMatchExcludedIds: Set<String> = emptySet(),
 ): List<ChatMessage> {
     val incoming = restMessages.dedupeById()
     val current = currentMessages.dedupeById()
-    val matches = matchTranscriptMessages(incoming, current, allowAssistantContentMatches = chronological)
+    val matches =
+        matchTranscriptMessages(
+            incoming,
+            current,
+            allowAssistantContentMatches = chronological,
+            contentMatchExcludedIds = contentMatchExcludedIds,
+        )
     val consumed = matches.mapNotNull { it?.id }.toSet()
     val merged =
         incoming.mapIndexed { index, message ->
@@ -378,16 +554,43 @@ internal fun mergeTranscriptWithLive(
             // Keep local user metadata and stable IDs already used by the renderer.
             when {
                 match?.role == MessageRole.USER -> {
+                    val baseContent =
+                        if (match.isHistoricalCache && !message.attachments.isNullOrEmpty()) {
+                            message.content
+                        } else {
+                            match.content
+                        }
+                    // #1432: cached rows lack attachment metadata, so hydrate from REST. #1459: a confirmed
+                    // gateway image set replaces optimistic local file sources that can disappear.
+                    val images =
+                        reconcileUserImages(match.attachments, baseContent, message.attachments, message.content)
                     match.copy(
+                        attachments = images.attachments,
+                        content = images.content,
                         restId = (message.canonicalRestId ?: match.canonicalRestId).takeUnless { it == match.id },
+                        serverRowId = message.serverRowId ?: match.serverRowId,
+                        reactions = message.reactions.ifEmpty { match.reactions },
                         displayKind = message.displayKind ?: match.displayKind,
+                        isHistoricalCache = false,
+                        isRestoredUnconfirmed = false,
                     )
                 }
 
-                preserveLiveIds && match != null && !match.id.startsWith("rest-") -> {
+                preserveLiveIds && match != null && !RestMessageId.isRest(match.id) -> {
+                    val mergedContent =
+                        if (match.role == MessageRole.ASSISTANT &&
+                            ChatVerifierFooter.split(match.content) != null &&
+                            ChatVerifierFooter.matchesBase(match.content, message.content)
+                        ) {
+                            match.content
+                        } else {
+                            message.content
+                        }
                     match.copy(
                         restId = message.canonicalRestId ?: match.canonicalRestId,
-                        content = message.content,
+                        serverRowId = message.serverRowId ?: match.serverRowId,
+                        reactions = message.reactions.ifEmpty { match.reactions },
+                        content = mergedContent,
                         timestamp = message.timestamp,
                         isStreaming = message.isStreaming,
                         reasoningText = message.reasoningText.ifBlank { match.reasoningText },
@@ -398,11 +601,28 @@ internal fun mergeTranscriptWithLive(
                         displayKind = message.displayKind ?: match.displayKind,
                         tokenCount = message.tokenCount ?: match.tokenCount,
                         completionId = message.completionId ?: match.completionId,
+                        isHistoricalCache = false,
+                        isRestoredUnconfirmed = false,
                     )
                 }
 
                 else -> {
-                    message.copy(completionId = message.completionId ?: match?.completionId)
+                    val mergedContent =
+                        if (message.role == MessageRole.ASSISTANT &&
+                            match != null &&
+                            ChatVerifierFooter.split(match.content) != null &&
+                            ChatVerifierFooter.matchesBase(match.content, message.content)
+                        ) {
+                            match.content
+                        } else {
+                            message.content
+                        }
+                    message.copy(
+                        content = mergedContent,
+                        completionId = message.completionId ?: match?.completionId,
+                        isHistoricalCache = false,
+                        isRestoredUnconfirmed = false,
+                    )
                 }
             }
         }
@@ -421,39 +641,112 @@ internal fun mergeTranscriptWithLive(
             .mapNotNull { index ->
                 matches[index]?.id?.let { id -> incoming[index].canonicalOrder?.let { id to it } }
             }.toMap()
-    return dedupeCachedMessages(transcript.inTranscriptOrder(current, resolvedOrders), confirmedOnly = true)
-        .reconcileReasoningRows()
+    return dedupeCachedMessages(
+        transcript.inTranscriptOrder(
+            previous = current,
+            resolvedOrders = resolvedOrders,
+            observedSuccessorAnchors = current,
+        ),
+        confirmedOnly = true,
+        contentMatchExcludedIds = contentMatchExcludedIds,
+    ).reconcileReasoningRows()
 }
 
 /** Keep server order; place local notices and commands after their last preceding confirmed message, not at the transcript tail. */
 private fun List<ChatMessage>.inTranscriptOrder(
     previous: List<ChatMessage>,
     resolvedOrders: Map<String, Long>,
+    observedSuccessorAnchors: List<ChatMessage>? = null,
 ): List<ChatMessage> {
     val latestCanonical = mapNotNull { it.canonicalOrder }.maxOrNull() ?: -1L
+    // Session-start markers use -1 and must remain before unresolved cached history.
+    val beforeCanonical = (mapNotNull { it.canonicalOrder }.filter { it >= 0L }.minOrNull() ?: 0L) - 1L
+    val timedCanonical = mapNotNull { m -> m.canonicalOrder?.takeIf { it >= 0L }?.let { m.timestamp to it } }
     var precedingCanonical: Long? = null
     var hasPendingPredecessor = false
     var pendingLocalOrder: Long? = null
     val localAnchors = mutableMapOf<String, Long>()
     val pendingOrderByLocal = mutableMapOf<String, Long>()
-    previous.forEach { message ->
+    val byId = (previous + this).associateBy { it.id }
+    // #1451: an observed live block must stay before its later confirmed USER successor,
+    // even when its own REST echoes are absent. Successor anchors derive only from genuinely
+    // observed current lists (never cache concatenations) and only from later USER prompts.
+    val nextCanonicalOrder = mutableMapOf<String, Long>()
+    val anchorSource = observedSuccessorAnchors ?: emptyList()
+    var followingUserCanonical: Long? = null
+    for (i in anchorSource.indices.reversed()) {
+        val message = anchorSource[i]
+        val order = resolvedOrders[message.id] ?: message.canonicalOrder
+        if (order != null && message.role == MessageRole.USER) {
+            followingUserCanonical = order
+        } else if (followingUserCanonical != null) {
+            nextCanonicalOrder[message.id] = followingUserCanonical
+        }
+    }
+    previous.forEach { previousMessage ->
+        val message = byId[previousMessage.id] ?: previousMessage
         val order = resolvedOrders[message.id] ?: message.canonicalOrder
         if (order != null) {
             precedingCanonical = order
             hasPendingPredecessor = false
             pendingLocalOrder = null
-        } else if (message.isPermanentlyLocal()) {
+        } else if (message.localOrder != null && message.isPermanentlyLocal() &&
+            message.localAnchorOrder == null && message.localPredecessorId == null
+        ) {
+            // Only migrated legacy rows lack durable placement. Room groups them after server rows;
+            // seat those by time, never overriding an explicit anchor or pending predecessor.
             localAnchors[message.id] =
-                if (hasPendingPredecessor) {
-                    Long.MAX_VALUE
-                } else {
-                    precedingCanonical?.takeIf { it >= 0L }
-                        ?: latestCanonical
+                timedCanonical.filter { it.first <= message.timestamp }.maxOfOrNull { it.second } ?: beforeCanonical
+        } else if (message.isPermanentlyLocal()) {
+            val predecessor = message.localPredecessorId?.let { byId[it] }
+            val predecessorOrder = predecessor?.let { resolvedOrders[it.id] ?: it.canonicalOrder }
+            localAnchors[message.id] =
+                when {
+                    predecessorOrder != null -> {
+                        predecessorOrder
+                    }
+
+                    predecessor != null -> {
+                        // An unresolved durable predecessor still bounds this local row when a
+                        // later USER was actually observed after the block. Never infer that
+                        // boundary from cache order alone.
+                        (nextCanonicalOrder[message.id] ?: nextCanonicalOrder[predecessor.id])
+                            ?.let { it - 1L } ?: Long.MAX_VALUE
+                    }
+
+                    message.localAnchorOrder != null -> {
+                        message.localAnchorOrder
+                    }
+
+                    hasPendingPredecessor -> {
+                        nextCanonicalOrder[message.id]?.let { it - 1L } ?: Long.MAX_VALUE
+                    }
+
+                    else -> {
+                        precedingCanonical?.takeIf { it >= 0L }
+                            ?: if (message.role == MessageRole.USER) {
+                                precedingCanonical ?: latestCanonical
+                            } else {
+                                latestCanonical
+                            }
+                    }
                 }
-            if (hasPendingPredecessor) pendingOrderByLocal[message.id] = pendingLocalOrder ?: Long.MAX_VALUE
+            if (predecessor != null && predecessorOrder == null) {
+                pendingOrderByLocal[message.id] = predecessor.localOrder ?: Long.MAX_VALUE
+            } else if (hasPendingPredecessor && message.localAnchorOrder == null && message.localOrder == null) {
+                pendingOrderByLocal[message.id] = pendingLocalOrder ?: Long.MAX_VALUE
+            }
+        } else if (message.isHistoricalCache || message.isRestoredUnconfirmed) {
+            // Room groups UUID-only rows after all confirmed rows; that predecessor is
+            // not a chronological anchor. Restored legacy rows stay before the server
+            // window too, without promoting their uncertain delivery to confirmed history.
+            localAnchors[message.id] = beforeCanonical
         } else {
             hasPendingPredecessor = true
             pendingLocalOrder = message.localOrder
+            nextCanonicalOrder[message.id]?.let { successor ->
+                localAnchors[message.id] = successor - 1L
+            }
         }
     }
     val previousIndices = previous.withIndex().associate { it.value.id to it.index }
@@ -462,15 +755,31 @@ private fun List<ChatMessage>.inTranscriptOrder(
             compareBy<IndexedValue<ChatMessage>> {
                 it.value.canonicalOrder ?: localAnchors[it.value.id] ?: Long.MAX_VALUE
             }.thenBy { if (localAnchors[it.value.id]?.let { anchor -> anchor != Long.MAX_VALUE } == true) 1 else 0 }
-                .thenBy { it.value.localOrder ?: pendingOrderByLocal[it.value.id] ?: Long.MAX_VALUE }
-                .thenBy { previousIndices[it.value.id] ?: it.index },
+                .thenBy {
+                    if (it.value.isSessionStartMarker() && it.value.localAnchorOrder != null) {
+                        Long.MIN_VALUE
+                    } else {
+                        it.value.localOrder ?: pendingOrderByLocal[it.value.id] ?: Long.MAX_VALUE
+                    }
+                }.thenBy { previousIndices[it.value.id] ?: it.index },
         ).map { it.value }
 }
 
 internal fun ChatMessage.isPermanentlyLocal(): Boolean =
     role == MessageRole.SYSTEM ||
-        (role == MessageRole.USER && (content.startsWith("/") || displayKind == "clarify_response")) ||
-        (role == MessageRole.ASSISTANT && displayKind == "local_feedback")
+        (role == MessageRole.USER && (content.startsWith("/") || displayKind == DisplayKind.CLARIFY_RESPONSE)) ||
+        (role == MessageRole.ASSISTANT && displayKind == DisplayKind.LOCAL_FEEDBACK)
+
+/** Capture visible placement before persistence/RPC suspension, not from Room's grouped cache order. */
+internal fun ChatMessage.withLocalTranscriptAnchor(previous: List<ChatMessage>): ChatMessage {
+    if (!isPermanentlyLocal() || canonicalRestId != null || isSessionStartMarker()) return this
+    val preceding = previous.lastOrNull { it.canonicalOrder != null }
+    val pending =
+        previous.drop((preceding?.let { previous.indexOf(it) } ?: -1) + 1).lastOrNull {
+            !it.isPermanentlyLocal() && !it.isHistoricalCache && !it.isRestoredUnconfirmed
+        }
+    return copy(localAnchorOrder = preceding?.canonicalOrder ?: -1L, localPredecessorId = pending?.id)
+}
 
 internal fun ChatMessage.isSessionStartMarker(): Boolean =
     role == MessageRole.SYSTEM && (content == "Session created" || content == "Session branched")
@@ -478,7 +787,7 @@ internal fun ChatMessage.isSessionStartMarker(): Boolean =
 private val ChatMessage.canonicalOrder: Long?
     get() =
         when {
-            isSessionStartMarker() -> -1L
+            isSessionStartMarker() -> if (localAnchorOrder == null) -1L else null
             localOrder != null && restId == null -> null
             else -> canonicalRestId?.substringAfterLast('-')?.toLongOrNull()
         }
@@ -518,6 +827,6 @@ internal fun mergeIncrementalTranscriptPage(
 internal fun serverMessageIndex(
     id: String,
     sessionId: String,
-): Int? = id.removePrefix("rest-$sessionId-").takeIf { it != id }?.toIntOrNull()
+): Int? = id.removePrefix(RestMessageId.sessionPrefix(sessionId)).takeIf { it != id }?.toIntOrNull()
 
 internal fun List<ChatMessage>.dedupeById(): List<ChatMessage> = associateBy { it.id }.values.toList()

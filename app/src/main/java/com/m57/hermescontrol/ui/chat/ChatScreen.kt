@@ -28,6 +28,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.input.clearText
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
@@ -64,11 +66,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -76,17 +79,23 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.m57.hermescontrol.BuildConfig
 import com.m57.hermescontrol.ExternalActivityLifecycleGuard
 import com.m57.hermescontrol.HistoryScreen
+import com.m57.hermescontrol.LogsScreen
 import com.m57.hermescontrol.NavigationController
 import com.m57.hermescontrol.R
+import com.m57.hermescontrol.data.local.AuthManager
 import com.m57.hermescontrol.data.model.Attachment
 import com.m57.hermescontrol.data.model.AttachmentSource
 import com.m57.hermescontrol.data.model.reasoningSupport
+import com.m57.hermescontrol.data.session.ActiveSessionHolder
 import com.m57.hermescontrol.data.ws.ConnectionStatus
 import com.m57.hermescontrol.data.ws.HermesWsClient
 import com.m57.hermescontrol.notification.NotificationHelper
+import com.m57.hermescontrol.theme.AppFontFamily
 import com.m57.hermescontrol.theme.LocalHermesStatusColors
+import com.m57.hermescontrol.theme.createTypography
 import com.m57.hermescontrol.ui.chat.components.ChatAppUpdateSection
 import com.m57.hermescontrol.ui.chat.components.ChatConnectionBanner
 import com.m57.hermescontrol.ui.chat.components.ChatHistoryWindowBanner
@@ -100,18 +109,28 @@ import com.m57.hermescontrol.ui.chat.components.ChatTimelineSheet
 import com.m57.hermescontrol.ui.chat.components.ConnectionSetupSheet
 import com.m57.hermescontrol.ui.chat.components.ContextDetailSheet
 import com.m57.hermescontrol.ui.chat.components.ContextUsageChip
+import com.m57.hermescontrol.ui.chat.components.MediaViewerDialog
+import com.m57.hermescontrol.ui.chat.components.PendingSendRecovery
 import com.m57.hermescontrol.ui.chat.components.ReactionHeartsOverlay
 import com.m57.hermescontrol.ui.chat.components.ReloginDialog
+import com.m57.hermescontrol.ui.chat.components.ReplyErrorCard
 import com.m57.hermescontrol.ui.chat.components.SearchBarRow
 import com.m57.hermescontrol.ui.chat.components.SessionIntegrationsSheet
 import com.m57.hermescontrol.ui.chat.components.SideQuestionSheet
+import com.m57.hermescontrol.ui.chat.components.SpeechRequest
+import com.m57.hermescontrol.ui.chat.components.SpeechText
 import com.m57.hermescontrol.ui.chat.components.SubagentInspectionSheet
 import com.m57.hermescontrol.ui.chat.components.TaskProgressChip
+import com.m57.hermescontrol.ui.chat.components.rememberChatImagePaste
 import com.m57.hermescontrol.ui.chat.components.rememberChatMediaLaunchers
 import com.m57.hermescontrol.ui.chat.components.rememberChatScrollController
+import com.m57.hermescontrol.ui.chat.components.rememberChatSpeech
+import com.m57.hermescontrol.ui.chat.components.replaceComposerDraft
+import com.m57.hermescontrol.ui.chat.components.restoreRejectedComposerDraft
 import com.m57.hermescontrol.ui.chat.components.shouldShowProgressChip
 import com.m57.hermescontrol.ui.chat.components.tailContentKey
 import com.m57.hermescontrol.ui.chat.fullbleed.FullBleedChatList
+import com.m57.hermescontrol.ui.chat.fullbleed.TranscriptActions
 import com.m57.hermescontrol.ui.common.ActionProgressDialog
 import com.m57.hermescontrol.ui.common.AutoScrollingTitleText
 import com.m57.hermescontrol.ui.common.CredentialWarningBanner
@@ -157,6 +176,7 @@ fun ChatScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val streamingState by viewModel.streamingState.collectAsStateWithLifecycle()
     val timelineState by viewModel.timelineState.collectAsStateWithLifecycle()
+    val transcriptState by viewModel.transcriptState.collectAsStateWithLifecycle()
     val credentialWarning by HermesWsClient.credentialWarning.collectAsStateWithLifecycle()
     val connectorsViewModel: ChatConnectorsViewModel = viewModel()
     val connectorsState by connectorsViewModel.uiState.collectAsStateWithLifecycle()
@@ -167,44 +187,33 @@ fun ChatScreen(
     // Snapshot-backed search state — read directly so only the scopes that
     // read its fields recompose on search changes (bar, matched bubbles).
     val searchState = viewModel.searchState
-    val displayedMessages = timelineState.historyMessages ?: state.messages
+    val displayedMessages = transcriptState.messages
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
-    var browserAuthInFlight by rememberSaveable { mutableStateOf(false) }
-    var browserAuthDeparted by rememberSaveable { mutableStateOf(false) }
-    var connectionBrowserOperationId by remember { mutableStateOf<String?>(null) }
-    var connectionBrowserDeparted by remember { mutableStateOf(false) }
+    // Chat font family, scoped to THIS surface: only the message list reads it
+    // via the LocalTypography override below, so the setting never mutates the
+    // typography of settings, navigation, or any other screen (Codex review).
+    val chatFontFamily by AuthManager.fontFamilyFlow.collectAsStateWithLifecycle()
 
     DisposableEffect(lifecycleOwner) {
         val observer =
             LifecycleEventObserver { _, event ->
                 when (event) {
                     Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
-                        if (browserAuthInFlight) {
-                            browserAuthDeparted = true
-                        }
-                        if (connectionBrowserOperationId != null) {
-                            connectionBrowserDeparted = true
-                        }
+                        connectorsViewModel.browserPaused()
+                        viewModel.connectionBrowserPaused()
                         connectorsViewModel.onPause()
                     }
 
                     Lifecycle.Event.ON_RESUME -> {
+                        viewModel.refreshSettings()
                         connectorsViewModel.onResume()
-                        val legacyBrowserReturned = browserAuthInFlight && browserAuthDeparted
-                        val operationId = connectionBrowserOperationId.takeIf { connectionBrowserDeparted }
+                        val legacyBrowserReturned = connectorsViewModel.browserReturned()
+                        val operationId = viewModel.connectionBrowserReturned()
                         if (legacyBrowserReturned || operationId != null) {
                             ExternalActivityLifecycleGuard.externalActivityReturned()
                         }
-                        if (legacyBrowserReturned) {
-                            browserAuthInFlight = false
-                            browserAuthDeparted = false
-                        }
-                        if (operationId != null) {
-                            connectionBrowserOperationId = null
-                            connectionBrowserDeparted = false
-                            viewModel.wakeConnectionOperation(operationId)
-                        }
+                        operationId?.let(viewModel::wakeConnectionOperation)
                     }
 
                     else -> {}
@@ -219,18 +228,11 @@ fun ChatScreen(
                     .firstOrNull()
             val isChangingConfigs = activity?.isChangingConfigurations == true
             if (!isChangingConfigs) {
-                val externalActivityOutstanding =
-                    (browserAuthInFlight && browserAuthDeparted) ||
-                        (connectionBrowserOperationId != null && connectionBrowserDeparted)
-                if (externalActivityOutstanding) {
+                val legacyOutstanding = connectorsViewModel.abandonBrowser()
+                val connectionOutstanding = viewModel.abandonConnectionBrowser()
+                if (legacyOutstanding || connectionOutstanding) {
                     ExternalActivityLifecycleGuard.externalActivityReturned()
                 }
-                if (browserAuthInFlight && browserAuthDeparted) {
-                    browserAuthInFlight = false
-                    browserAuthDeparted = false
-                }
-                connectionBrowserOperationId = null
-                connectionBrowserDeparted = false
                 connectorsViewModel.onPause()
                 connectorsViewModel.hide()
             }
@@ -238,6 +240,10 @@ fun ChatScreen(
     }
 
     val browserEvent = connectorsState.browserLaunchEvent
+    val speechController = rememberChatSpeech()
+    val speakingMessageId by speechController.speakingId.collectAsStateWithLifecycle()
+    val dataScope by AuthManager.dataScopeFlow.collectAsStateWithLifecycle()
+    val activeSessionId by ActiveSessionHolder.activeSessionId.collectAsStateWithLifecycle()
     val listState = rememberLazyListState(prefetchStrategy = ChatTimelineNoPrefetchStrategy)
     val scrollScope = rememberCoroutineScope()
     val scrollController = rememberChatScrollController(listState, scrollScope)
@@ -309,7 +315,7 @@ fun ChatScreen(
     // streaming tail.
     LaunchedEffect(
         timelineState.isHistorical,
-        state.messages,
+        displayedMessages,
         streamingState.streamingMessage,
         streamingState.isThinking,
         state.subagentIndicators,
@@ -323,19 +329,18 @@ fun ChatScreen(
         scrollController.onTailChanged(
             tailKey =
                 tailContentKey(
-                    messages = state.messages,
+                    messages = displayedMessages,
                     streamingMessage = streamingState.streamingMessage,
                     isThinking = streamingState.isThinking,
                     subagentIndicators = state.subagentIndicators,
                     clarifyRequest = state.clarifyRequest,
                 ),
-            messageCount = state.messages.size,
+            messageCount = displayedMessages.size,
         )
     }
     LaunchedEffect(timelineState.historyAnchorRowId) {
         if (timelineState.isHistorical && displayedMessages.isNotEmpty()) {
-            scrollController.pauseFollowing()
-            listState.scrollToItem(0)
+            scrollController.jumpToHistoryStart()
         }
     }
     val showScrollToBottom by remember(timelineState.isHistorical, displayedMessages) {
@@ -343,24 +348,21 @@ fun ChatScreen(
             !timelineState.isHistorical && scrollController.showFab(displayedMessages.isNotEmpty())
         }
     }
-    var inputFieldValue by rememberSaveable(stateSaver = TextFieldValue.Saver) {
-        mutableStateOf(TextFieldValue(""))
-    }
+    val inputState = rememberTextFieldState()
 
     LaunchedEffect(state.pendingPrefillText) {
         val prefill = state.pendingPrefillText
         if (prefill != null) {
-            inputFieldValue = ChatInputPolicy.commandFieldValue(prefill)
+            inputState.replaceComposerDraft(prefill)
             viewModel.consumePendingPrefill()
         }
     }
     LaunchedEffect(state.composerTextToRestore) {
         state.composerTextToRestore?.let { text ->
-            inputFieldValue = ChatInputPolicy.restoreRejectedText(text, inputFieldValue)
+            inputState.restoreRejectedComposerDraft(text)
             viewModel.consumeComposerTextRestore()
         }
     }
-    var lastAnimatedMessageId by rememberSaveable { mutableStateOf<String?>(null) }
     var showReloginDialog by rememberSaveable { mutableStateOf(false) }
     var showSubagentInspectionSheet by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(showSubagentInspectionSheet) {
@@ -370,6 +372,10 @@ fun ChatScreen(
     }
     var viewingImage by rememberSaveable { mutableStateOf<ImageViewerModel?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
+    val imagePaste =
+        rememberChatImagePaste(viewModel) { message ->
+            scrollScope.launch { snackbarHostState.showSnackbar(message) }
+        }
     val launchExternalActivity: (() -> Unit) -> Unit = { launch ->
         ExternalActivityLifecycleGuard.launchExternalActivity(
             acquireConnectionLease = HermesWsClient::acquireExternalActivityConnectionLease,
@@ -398,21 +404,17 @@ fun ChatScreen(
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                         }
                     launchExternalActivity {
-                        browserAuthDeparted = false
-                        browserAuthInFlight = true
+                        connectorsViewModel.browserLaunched()
                         context.startActivity(intent)
                     }
                 } catch (_: ActivityNotFoundException) {
-                    browserAuthInFlight = false
-                    browserAuthDeparted = false
+                    connectorsViewModel.browserLaunchFailed()
                     connectorsViewModel.launchError(browserLaunchError)
                 } catch (_: SecurityException) {
-                    browserAuthInFlight = false
-                    browserAuthDeparted = false
+                    connectorsViewModel.browserLaunchFailed()
                     connectorsViewModel.launchError(browserLaunchError)
                 } catch (_: Exception) {
-                    browserAuthInFlight = false
-                    browserAuthDeparted = false
+                    connectorsViewModel.browserLaunchFailed()
                     connectorsViewModel.launchError(browserLaunchError)
                 }
             }
@@ -421,13 +423,15 @@ fun ChatScreen(
 
     val mediaLaunchers =
         rememberChatMediaLaunchers(
-            inputFieldValue = inputFieldValue,
-            onInputFieldValueChange = { inputFieldValue = it },
+            inputState = inputState,
             onAddAttachment = { uri, name, mimeType, size ->
                 viewModel.addAttachment(uri, name, mimeType, size)
             },
             onAddAttachments = { attachments ->
                 viewModel.addAttachments(attachments)
+            },
+            onVoiceNoteRecorded = { file ->
+                viewModel.sendVoiceNote(file)
             },
             onShowMessage = { msg ->
                 scrollScope.launch {
@@ -435,6 +439,7 @@ fun ChatScreen(
                 }
             },
             launchExternalActivity = launchExternalActivity,
+            isTranscribingVoiceNote = state.isTranscribingVoiceNote,
             context = context,
         )
 
@@ -519,7 +524,7 @@ fun ChatScreen(
         },
         navigationIcon = onOpenDrawer?.let { NavIcon.Menu(it) },
         snackbarHost = {
-            SnackbarHost(snackbarHostState) { data ->
+            SnackbarHost(snackbarHostState, modifier = Modifier.imePadding()) { data ->
                 val statusColors = LocalHermesStatusColors.current
                 val isDownloadComplete = data.visuals.message.startsWith("Saved ")
                 Snackbar(
@@ -739,52 +744,84 @@ fun ChatScreen(
 
                 // Full-bleed chat renderer (issue #866) — the single chat
                 // surface since the bubble renderer was removed.
-                FullBleedChatList(
-                    messages = displayedMessages,
-                    streamingState = if (timelineState.isHistorical) StreamingState() else streamingState,
-                    isAgentTyping = state.isAgentTyping && !timelineState.isHistorical,
-                    searchState = searchState,
-                    typingEffectEnabled = state.typingEffectEnabled && !timelineState.isHistorical,
-                    typingEffectDelayMs = state.typingEffectDelayMs,
-                    messageStatsEnabled = state.messageStatsEnabled,
-                    showUserMessageTokens = state.showUserMessageTokens,
-                    showAssistantMessageTokens = state.showAssistantMessageTokens,
-                    showTokensPerSecond = state.showTokensPerSecond,
-                    maxToolCallsPerTurn = state.maxToolCallsPerTurn,
-                    isLoading = state.isLoading && !timelineState.isHistorical,
-                    isLoadingOlder = state.isLoadingOlder && !timelineState.isHistorical,
-                    hasOlderMessages = state.hasOlderMessages && !timelineState.isHistorical,
-                    pagingSessionId =
-                        state.currentSessionId?.let { currentSessionId ->
-                            if (timelineState.isHistorical) {
-                                currentSessionId + ":history:" + timelineState.historyAnchorRowId
-                            } else {
-                                currentSessionId
-                            }
-                        },
-                    listState = listState,
-                    scrollController = scrollController,
-                    lastAnimatedMessageId = lastAnimatedMessageId,
-                    onLastAnimatedMessageIdChange = { lastAnimatedMessageId = it },
-                    viewModel = viewModel,
-                    clarifyRequest = state.clarifyRequest.takeUnless { timelineState.isHistorical },
-                    onRespondClarify = viewModel::respondToClarify,
-                    onRespondClarifyBatch = viewModel::respondToClarifyBatch,
-                    onDismissClarify = viewModel::dismissClarify,
-                    vaultUnlockPrompt = state.vaultUnlockPrompt.takeUnless { timelineState.isHistorical },
-                    onRespondVaultUnlock = viewModel::respondToVaultUnlock,
-                    onDismissVaultUnlock = viewModel::dismissVaultUnlock,
-                    vaultSaveLoginPrompt = state.vaultSaveLoginPrompt.takeUnless { timelineState.isHistorical },
-                    onRespondVaultSaveLogin = viewModel::respondToVaultSaveLogin,
-                    onDismissVaultSaveLogin = viewModel::dismissVaultSaveLogin,
-                    vaultCodePrompt = state.vaultCodePrompt.takeUnless { timelineState.isHistorical },
-                    onRespondVaultCode = viewModel::respondToVaultCode,
-                    onDismissVaultCode = viewModel::dismissVaultCode,
-                    onSaveAttachment = onSaveAttachment,
-                    savingAttachmentPath = pendingSavePath ?: state.savingAttachmentPath,
-                    openingAttachmentPath = state.openingAttachmentPath,
-                    onImageClick = { viewingImage = it },
-                )
+                // The "Chat Font Family" setting is scoped to THIS subtree: a
+                // nested MaterialTheme rebinding typography from the chat font
+                // family so only the message list picks it up — settings,
+                // navigation, and every other screen keep the default type
+                // (Codex review: scope the font choice, don't mutate unrelated UI).
+                val chatTypography = createTypography(AppFontFamily.fromKey(chatFontFamily).toFontFamily)
+                MaterialTheme(typography = chatTypography) {
+                    FullBleedChatList(
+                        transcript =
+                            transcriptState.copy(
+                                savingAttachmentPath = pendingSavePath ?: transcriptState.savingAttachmentPath,
+                                speakingMessageId = speakingMessageId,
+                            ),
+                        actions =
+                            TranscriptActions(
+                                onLoadOlder = viewModel::loadOlderMessages,
+                                onOpenAttachment = viewModel::openAttachment,
+                                onSaveAttachment = onSaveAttachment,
+                                onImageClick = { viewingImage = it },
+                                onRespondApproval = viewModel::respondToApproval,
+                                onRespondClarify = viewModel::respondToClarify,
+                                onRespondClarifyBatch = viewModel::respondToClarifyBatch,
+                                onDismissClarify = viewModel::dismissClarify,
+                                onRespondVaultUnlock = viewModel::respondToVaultUnlock,
+                                onDismissVaultUnlock = viewModel::dismissVaultUnlock,
+                                onRespondVaultSaveLogin = viewModel::respondToVaultSaveLogin,
+                                onDismissVaultSaveLogin = viewModel::dismissVaultSaveLogin,
+                                onRespondVaultCode = viewModel::respondToVaultCode,
+                                onDismissVaultCode = viewModel::dismissVaultCode,
+                                onToggleSpeak = { message ->
+                                    val scopeKey = "${dataScope?.inMemoryKey(localKey = activeSessionId ?: "none")}"
+                                    speechController.toggle(
+                                        SpeechRequest(
+                                            scopeKey = scopeKey,
+                                            messageId = message.id,
+                                            text = SpeechText.stripMarkdownForSpeech(message.content),
+                                        ),
+                                    )
+                                },
+                            ),
+                        searchState = searchState,
+                        listState = listState,
+                        scrollController = scrollController,
+                        replyErrorContent =
+                            state.replyFailure?.takeUnless { timelineState.isHistorical }?.let { failure ->
+                                {
+                                    val clipboard = LocalClipboardManager.current
+                                    val copiedMessage = stringResource(R.string.chat_reply_failed_copied)
+                                    val shareTitle = stringResource(R.string.chat_reply_failed_share)
+                                    val shareUnavailable = stringResource(R.string.chat_reply_failed_share_unavailable)
+                                    ReplyErrorCard(
+                                        failure = failure,
+                                        onDismiss = { viewModel.dismissReplyFailure(failure.id) },
+                                        onOpenLogs = { NavigationController.navigateTo(LogsScreen) },
+                                        onCopy = { details ->
+                                            clipboard.setText(AnnotatedString(details))
+                                            scrollScope.launch { snackbarHostState.showSnackbar(copiedMessage) }
+                                        },
+                                        onShare = { details ->
+                                            val report = "Hermes Mobile ${BuildConfig.VERSION_NAME}\n\n$details"
+                                            val intent =
+                                                Intent(Intent.ACTION_SEND).apply {
+                                                    type = "text/plain"
+                                                    putExtra(Intent.EXTRA_TEXT, report)
+                                                }
+                                            try {
+                                                launchExternalActivity {
+                                                    context.startActivity(Intent.createChooser(intent, shareTitle))
+                                                }
+                                            } catch (_: ActivityNotFoundException) {
+                                                scrollScope.launch { snackbarHostState.showSnackbar(shareUnavailable) }
+                                            }
+                                        },
+                                    )
+                                }
+                            },
+                    )
+                }
 
                 // Loading overlay
                 ChatLoadingOverlay(
@@ -834,19 +871,43 @@ fun ChatScreen(
                     },
             )
 
+            if (!timelineState.isHistorical) {
+                PendingSendRecovery(
+                    sends = state.pendingSends,
+                    canSend = state.isConnected && state.isSessionReady,
+                    mainTurnBusy = state.isMainTurnBusy,
+                    onSendAgain = viewModel::sendQueuedNow,
+                    onDiscard = viewModel::discardPendingSend,
+                    onAcknowledge = viewModel::acknowledgePendingSend,
+                    onRemoveAcknowledged = viewModel::removeAcknowledgedPendingSend,
+                    onOpenAttachment = viewModel::openAttachment,
+                    onImageClick = { viewingImage = it },
+                )
+            }
+
             ChatInputBar(
-                inputFieldValue = inputFieldValue,
-                onInputChange = { inputFieldValue = it },
+                inputState = inputState,
+                receiveContentListener = imagePaste,
+                isReceivingContent = imagePaste.isReceiving,
                 onSend = {
-                    if (viewModel.sendMessage(inputFieldValue.text)) {
-                        inputFieldValue = TextFieldValue("")
+                    if (!imagePaste.isReceiving && viewModel.sendMessage(inputState.text.toString())) {
+                        inputState.clearText()
                         // Jump only after an accepted send. A readiness race keeps the draft intact.
                         scrollController.jumpToBottom(animated = true)
                     }
                 },
                 onMicTap = mediaLaunchers.onMicTap,
-                isListening = mediaLaunchers.isListening,
+                onMicHoldStart = mediaLaunchers.onMicHoldStart,
+                onMicHoldEnd = mediaLaunchers.onMicHoldEnd,
+                onMicHoldCancel = mediaLaunchers.onMicHoldCancel,
+                onMicLock = mediaLaunchers.onMicLock,
+                isListening = mediaLaunchers.isListening || state.isTranscribingVoiceNote,
+                isRecordingVoice = mediaLaunchers.isRecordingVoice,
+                isVoiceNoteLocked = mediaLaunchers.isVoiceNoteLocked,
+                amplitudeProvider = mediaLaunchers.amplitudeProvider,
+                onStopGeneration = { viewModel.interruptSession() },
                 isAgentTyping = state.isAgentTyping,
+                canInterrupt = state.canInterrupt,
                 isConnected = state.isConnected,
                 isSessionReady = state.isSessionReady && !timelineState.isHistorical,
                 sessionPreparationFailed = state.resumeError != null,
@@ -996,9 +1057,11 @@ fun ChatScreen(
         }
 
         viewingImage?.let { image ->
-            ImageViewerDialog(
-                image = image,
-                onDismiss = { viewingImage = null },
+            MediaViewerDialog(
+                mediaUri = image.model,
+                onDismissRequest = { viewingImage = null },
+                title = image.name.ifBlank { null },
+                mimeType = image.mimeType,
             )
         }
 
@@ -1011,8 +1074,7 @@ fun ChatScreen(
                     if (ConnectorUrlValidator.isValidHttpsUrl(url)) {
                         try {
                             launchExternalActivity {
-                                connectionBrowserOperationId = operationId
-                                connectionBrowserDeparted = false
+                                viewModel.connectionBrowserLaunched(operationId)
                                 val intent =
                                     Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
                                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1020,8 +1082,7 @@ fun ChatScreen(
                                 context.startActivity(intent)
                             }
                         } catch (_: Exception) {
-                            connectionBrowserOperationId = null
-                            connectionBrowserDeparted = false
+                            viewModel.connectionBrowserLaunchFailed()
                             scrollScope.launch { snackbarHostState.showSnackbar(browserLaunchError) }
                         }
                     }

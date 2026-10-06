@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.HistoryEdu
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Power
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Schedule
@@ -32,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.navigation3.runtime.NavKey
 import com.m57.hermescontrol.ui.common.NeurologyIcon
+import com.m57.hermescontrol.ui.settings.ConnectionsPage
 import com.m57.hermescontrol.ui.achievements.AchievementsScreen as AchievementsScreenContent
 import com.m57.hermescontrol.ui.analytics.AnalyticsScreen as AnalyticsScreenContent
 import com.m57.hermescontrol.ui.billing.BillingScreen as BillingScreenContent
@@ -57,6 +59,7 @@ import com.m57.hermescontrol.ui.sessions.SessionsScreen as HistoryScreenContent
 import com.m57.hermescontrol.ui.settings.SettingsScreen as SettingsScreenContent
 import com.m57.hermescontrol.ui.skills.SkillsScreen as SkillsScreenContent
 import com.m57.hermescontrol.ui.system.SystemScreen as SystemScreenContent
+import com.m57.hermescontrol.ui.thememarketplace.ThemeMarketplaceScreen as ThemeMarketplaceScreenContent
 import com.m57.hermescontrol.ui.toolsets.ToolsetsScreen as ToolsetsScreenContent
 import com.m57.hermescontrol.ui.webhooks.WebhooksScreen as WebhooksScreenContent
 
@@ -236,6 +239,18 @@ object ScreenRegistry {
                 Icons.Filled.EmojiEvents,
                 DrawerSection.INSPECT,
             ) { sessionId, openDrawer -> AchievementsScreenContent(onOpenDrawer = openDrawer) },
+            ScreenDefinition(
+                ConnectionsScreen,
+                R.string.screen_connections,
+                Icons.Filled.Dns,
+                null,
+            ) { _, _ -> ConnectionsPage() },
+            ScreenDefinition(
+                ThemeMarketplaceScreen,
+                R.string.screen_themes,
+                Icons.Filled.Palette,
+                DrawerSection.CONFIGURE,
+            ) { sessionId, openDrawer -> ThemeMarketplaceScreenContent(onOpenDrawer = openDrawer) },
             ScreenDefinition(
                 SettingsScreen,
                 R.string.screen_settings,

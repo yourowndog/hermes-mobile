@@ -1,6 +1,7 @@
 package com.m57.hermescontrol.ui.chat
 
 import com.m57.hermescontrol.data.model.Attachment
+import com.m57.hermescontrol.data.model.MessageReaction
 import java.util.UUID
 
 /**
@@ -34,6 +35,12 @@ data class ToolOutputRiskData(
     val findings: List<String>,
     val redacted: Boolean,
 )
+
+/** Durable evidence about a locally-created row; UNKNOWN must not be treated as proof of delivery. */
+enum class MessageProvenance {
+    UNKNOWN,
+    LOCAL_PENDING,
+}
 
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -91,11 +98,37 @@ data class ChatMessage(
     val restId: String? = null,
     /** Cache insertion sequence for unconfirmed local rows; null before first persistence. */
     val localOrder: Long? = null,
+    /** Placement only: preceding confirmed server order. Never an identity or delivery receipt. */
+    val localAnchorOrder: Long? = null,
+    /** A live unresolved predecessor whose eventual canonical alias determines local placement. */
+    val localPredecessorId: String? = null,
+    /** Persisted before prompt submission so process death cannot turn an unsent prompt into old history. */
+    val messageProvenance: MessageProvenance = MessageProvenance.UNKNOWN,
+    /** Read from history, not observed live in this view. Never persisted as delivery state. */
+    val isHistoricalCache: Boolean = false,
+    /**
+     * Legacy USER restored without a canonical identity or a current send receipt.
+     * Placement only: keep it outside the live tail without asserting delivery.
+     * Transient; UNKNOWN provenance and the persisted row remain unchanged.
+     */
+    val isRestoredUnconfirmed: Boolean = false,
+    /**
+     * Gateway SQLite row id (#1285): from REST `id`, the `prompt.submit` `user_row_id`
+     * receipt, or `persisted_turn.final_assistant_row_id`. Null means unproven, never rejected.
+     * Scoped to the owning profile store; transient.
+     */
+    val serverRowId: Long? = null,
+    /** Emoji tapbacks on this message (REST `display_metadata` or live `message.reaction`); transient. */
+    val reactions: List<MessageReaction> = emptyList(),
 )
 
 /** Cached REST rows already carry their canonical identity in the persisted primary key. */
 internal val ChatMessage.canonicalRestId: String?
-    get() = restId ?: id.takeIf { it.startsWith("rest-") }
+    get() = restId ?: id.takeIf(RestMessageId::isRest)
+
+/** A persisted RUNNING snapshot is not evidence of current tool activity. */
+internal val ChatMessage.isToolRunning: Boolean
+    get() = toolStatus == ToolStatus.RUNNING && !isHistoricalCache
 
 /**
  * Single live transcript log entry for subagent execution.

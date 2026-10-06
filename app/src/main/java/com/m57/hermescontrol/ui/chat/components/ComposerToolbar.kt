@@ -6,8 +6,12 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -48,12 +52,20 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -62,6 +74,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.m57.hermescontrol.R
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Bottom controls row for the chat composer, rendered inside the composer card.
@@ -83,6 +96,7 @@ import com.m57.hermescontrol.R
  * When [supportsReasoning] is false the model takes no reasoning parameter
  * and the level menu is disabled.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ComposerToolbar(
     isConnected: Boolean,
@@ -107,11 +121,90 @@ fun ComposerToolbar(
     reasoningWireLevel: String? = null,
     pendingReasoningLevel: String? = null,
     isSessionReady: Boolean = true,
+    canInterrupt: Boolean = false,
+    onMicHoldStart: () -> Unit = {},
+    onMicHoldEnd: () -> Unit = {},
+    onMicHoldCancel: () -> Unit = {},
+    onMicLock: () -> Unit = {},
+    isVoiceNoteLocked: Boolean = false,
+    onSlideProgress: (Float) -> Unit = {},
+    onStopGeneration: () -> Unit = {},
 ) {
     var showReasoningMenu by remember { mutableStateOf(false) }
     val palette = composerPalette()
     val reasoningDisabledForModel = supportsReasoning == false
     val canDisable = canDisableReasoning
+
+    // Telegram-style voice notes: hold to record, release to send, slide left
+    // to cancel, slide up to lock hands-free. Both mic controls run the same
+    // single pointer loop (micHoldHandler), which owns the whole press until
+    // finger-up — so the release that submits the note can never be lost
+    // between recompositions.
+    val currentIsConnected = rememberUpdatedState(isConnected)
+    val currentShowSend = rememberUpdatedState(showSend)
+    val currentCanInterrupt = rememberUpdatedState(canInterrupt)
+    val currentIsVoiceNoteLocked = rememberUpdatedState(isVoiceNoteLocked)
+    val currentOnMicHoldStart = rememberUpdatedState(onMicHoldStart)
+    val currentOnMicHoldEnd = rememberUpdatedState(onMicHoldEnd)
+    val currentOnMicHoldCancel = rememberUpdatedState(onMicHoldCancel)
+    val currentOnMicLock = rememberUpdatedState(onMicLock)
+    val currentOnSlideProgress = rememberUpdatedState(onSlideProgress)
+    // The mic button is under the thumb during the gesture, so the outcome —
+    // lock or cancel — must be felt as well as seen.
+    val haptic = LocalHapticFeedback.current
+    // Telegram's slide-to-cancel span: a third of the composer width, capped
+    // at [MAX_CANCEL_DISTANCE_DP]. The gesture modifier sits on the mic button
+    // itself (only ~40 dp wide), so the span derives from the screen width.
+    val cancelDistancePx =
+        with(LocalDensity.current) {
+            minOf(
+                LocalConfiguration.current.screenWidthDp.dp
+                    .toPx() * 0.35f,
+                MAX_CANCEL_DISTANCE_DP.dp.toPx(),
+            )
+        }
+    val flatMicGesture =
+        Modifier.pointerInput(Unit) {
+            micHoldHandler(
+                isEnabled = {
+                    currentIsConnected.value && currentShowSend.value && !currentCanInterrupt.value &&
+                        !currentIsVoiceNoteLocked.value
+                },
+                onHoldStart = { currentOnMicHoldStart.value() },
+                onHoldEnd = { currentOnMicHoldEnd.value() },
+                onHoldCancel = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    currentOnMicHoldCancel.value()
+                },
+                onHoldLock = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    currentOnMicLock.value()
+                },
+                onSlideProgress = { currentOnSlideProgress.value(it) },
+                cancelDistance = cancelDistancePx,
+            )
+        }
+    val actionMicGesture =
+        Modifier.pointerInput(Unit) {
+            micHoldHandler(
+                isEnabled = {
+                    currentIsConnected.value && !currentShowSend.value && !currentCanInterrupt.value &&
+                        !currentIsVoiceNoteLocked.value
+                },
+                onHoldStart = { currentOnMicHoldStart.value() },
+                onHoldEnd = { currentOnMicHoldEnd.value() },
+                onHoldCancel = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    currentOnMicHoldCancel.value()
+                },
+                onHoldLock = {
+                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    currentOnMicLock.value()
+                },
+                onSlideProgress = { currentOnSlideProgress.value(it) },
+                cancelDistance = cancelDistancePx,
+            )
+        }
 
     Row(
         modifier =
@@ -408,55 +501,119 @@ fun ComposerToolbar(
             }
         }
 
-        // Flat mic / stop button — only while the action button is in send mode
+        // Flat slot — mic while idle. While a generation can be interrupted and a
+        // draft exists, Stop moves here so the rightmost action button stays
+        // Send (desktop parity: a payload keeps Send primary mid-turn; an empty
+        // draft makes Stop primary). During session preparation the mic stays
+        // here and the action button is a disabled send: Stop must not appear
+        // when there is nothing to interrupt (review, PR #1250).
         AnimatedVisibility(
             visible = showSend,
             enter = fadeIn() + scaleIn(initialScale = 0.8f),
             exit = fadeOut() + scaleOut(targetScale = 0.8f),
         ) {
-            FilledIconButton(
-                onClick = onMicTap,
-                enabled = isConnected,
-                colors = if (isListening) listeningIconButtonColors() else flatIconButtonColors(palette),
-                modifier =
-                    Modifier
-                        .size(ControlSize)
-                        .testTag(if (isListening) "mic_stop_button" else "mic_button"),
-            ) {
-                Icon(
-                    imageVector = if (isListening) Icons.Default.Stop else Icons.Outlined.Mic,
-                    contentDescription = if (isListening) "Stop listening" else "Mic",
-                )
+            if (canInterrupt) {
+                FilledIconButton(
+                    onClick = onStopGeneration,
+                    colors = flatIconButtonColors(palette),
+                    modifier =
+                        Modifier
+                            .size(ControlSize)
+                            .testTag("stop_button"),
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Stop,
+                        contentDescription = stringResource(R.string.chat_voice_stop_generating),
+                    )
+                }
+            } else {
+                // Plain Box, not FilledIconButton: the hold gesture must sit
+                // innermost in the pointer-modifier chain so it consumes the
+                // release before the tap handler — impossible while the button
+                // supplies its own clickable (review, PR #1280). Same
+                // arrangement as the action button below.
+                val micColors = if (isListening) listeningIconButtonColors() else flatIconButtonColors(palette)
+                Box(
+                    modifier =
+                        Modifier
+                            .size(ControlSize)
+                            .clip(CircleShape)
+                            .background(
+                                if (isConnected) micColors.containerColor else micColors.disabledContainerColor,
+                            ).combinedClickable(
+                                enabled = isConnected,
+                                onClick = onMicTap,
+                            ).testTag(if (isListening) "mic_stop_button" else "mic_button")
+                            .then(flatMicGesture),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = if (isListening) Icons.Default.Stop else Icons.Outlined.Mic,
+                        contentDescription = if (isListening) "Stop listening" else "Mic",
+                        tint = if (isConnected) micColors.contentColor else micColors.disabledContentColor,
+                    )
+                }
             }
         }
 
         // Action button — send when a send is possible, mic / stop otherwise
-        FilledIconButton(
-            onClick = if (showSend) onSend else onMicTap,
-            enabled = if (showSend) canSend else isConnected,
-            colors =
-                if (!showSend && isListening) {
-                    listeningIconButtonColors()
-                } else {
-                    IconButtonDefaults.filledIconButtonColors(
-                        containerColor = palette.action,
-                        contentColor = palette.onAction,
-                    )
-                },
+        // While a recording is locked this button finishes the voice note, so
+        // it must stay enabled even when the draft alone would not send
+        // (review, PR #1280).
+        // Stop owns the action button only when there is no draft to send;
+        // with a draft it lives in the flat slot above.
+        val actionStops = canInterrupt && !showSend
+        val actionEnabled =
+            if (isVoiceNoteLocked) {
+                true
+            } else if (showSend) {
+                canSend
+            } else {
+                isConnected
+            }
+        Box(
             modifier =
                 Modifier
-                    .size(ControlSize)
-                    .testTag(
+                    .size(if (showSend) 48.dp else ControlSize)
+                    .clip(CircleShape)
+                    .background(
+                        if (!showSend && isListening) {
+                            MaterialTheme.colorScheme.errorContainer
+                        } else {
+                            palette.action
+                        },
+                    ).combinedClickable(
+                        enabled = actionEnabled,
+                        onClick = {
+                            when {
+                                // A locked recording always finishes with this
+                                // button, draft or agent state regardless
+                                // (review, PR #1280).
+                                isVoiceNoteLocked -> onMicTap()
+
+                                actionStops -> onStopGeneration()
+
+                                showSend -> onSend()
+
+                                else -> onMicTap()
+                            }
+                        },
+                    ).testTag(
                         when {
+                            isVoiceNoteLocked -> "voice_note_send_button"
+                            actionStops -> "stop_button"
                             showSend -> "send_button"
                             isListening -> "mic_stop_button"
                             else -> "mic_button"
                         },
-                    ),
+                    ).then(if (showSend || canInterrupt) Modifier else actionMicGesture),
+            contentAlignment = Alignment.Center,
         ) {
             Crossfade(
                 targetState =
                     when {
+                        isVoiceNoteLocked -> ActionGlyph.SEND
+                        actionStops -> ActionGlyph.STOP
                         showSend -> ActionGlyph.SEND
                         isListening -> ActionGlyph.STOP
                         else -> ActionGlyph.VOICE
@@ -467,16 +624,40 @@ fun ComposerToolbar(
                     ActionGlyph.SEND -> {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.Send,
-                            contentDescription = stringResource(R.string.chat_send_desc),
+                            contentDescription =
+                                if (isVoiceNoteLocked) {
+                                    stringResource(R.string.chat_voice_send_desc)
+                                } else {
+                                    stringResource(R.string.chat_send_desc)
+                                },
+                            tint = palette.onAction,
                         )
                     }
 
                     ActionGlyph.STOP -> {
-                        Icon(imageVector = Icons.Default.Stop, contentDescription = "Stop listening")
+                        Icon(
+                            imageVector = Icons.Default.Stop,
+                            contentDescription =
+                                if (canInterrupt) {
+                                    stringResource(R.string.chat_voice_stop_generating)
+                                } else {
+                                    "Stop listening"
+                                },
+                            tint =
+                                if (isListening && !canInterrupt) {
+                                    MaterialTheme.colorScheme.onErrorContainer
+                                } else {
+                                    palette.onAction
+                                },
+                        )
                     }
 
                     ActionGlyph.VOICE -> {
-                        Icon(imageVector = Icons.Outlined.Mic, contentDescription = "Mic")
+                        Icon(
+                            imageVector = Icons.Outlined.Mic,
+                            contentDescription = "Mic",
+                            tint = palette.onAction,
+                        )
                     }
                 }
             }
@@ -581,3 +762,138 @@ fun buildReasoningLabel(
     }
     return reqLabel
 }
+
+/**
+ * Telegram-style mic gesture: press and hold past [HOLD_TO_RECORD_THRESHOLD_MS]
+ * records a voice note, release sends it, dragging into the cancel zone
+ * cancels, and sliding up past [MIC_SLIDE_LOCK_DP] locks the recording
+ * hands-free. Short taps use the control's normal click handler for dictation,
+ * so touch and accessibility actions share one callback path.
+ *
+ * Distances and outcomes mirror Telegram's recorder: the full cancel distance
+ * is a third of the composer capped at [MAX_CANCEL_DISTANCE_DP]; releasing
+ * below [CANCEL_RELEASE_ALPHA] of it cancels (dragging back out before release
+ * un-cancels); dragging all the way cancels mid-gesture; [onSlideProgress]
+ * reports the 1 → 0 drag fraction so the recording strip can track and fade
+ * its hint; locking only arms while the gesture stays clear of the cancel zone
+ * ([LOCK_MIN_ALPHA]).
+ *
+ * The whole down-to-up sequence lives in this one pointer loop, so the release
+ * that submits can never be lost to a recomposition between press and
+ * finger-up — an earlier interaction-source based approach could lose it and
+ * leave the recorder running until some later tap "sent" the stale clip.
+ *
+ * Once the hold phase arms, every event is consumed: the shared click handler
+ * otherwise also observes the stationary release that ends a hold (there is no
+ * drag to cancel it), and re-dispatches the tap action — the system dictation
+ * intent launched every time a voice note was sent (regression, #1247).
+ */
+private suspend fun PointerInputScope.micHoldHandler(
+    isEnabled: () -> Boolean,
+    onHoldStart: () -> Unit,
+    onHoldEnd: () -> Unit,
+    onHoldCancel: () -> Unit,
+    onHoldLock: () -> Unit,
+    onSlideProgress: (Float) -> Unit,
+    cancelDistance: Float,
+) {
+    val lockSlop = MIC_SLIDE_LOCK_DP.dp.toPx()
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        if (!isEnabled()) {
+            return@awaitEachGesture
+        }
+
+        fun slideAlpha(position: Offset): Float =
+            (1f + (position.x - down.position.x) / cancelDistance).coerceIn(0f, 1f)
+
+        fun slidUp(position: Offset): Boolean = position.y - down.position.y < -lockSlop
+
+        // Phase 1 — a finger-up before the threshold is a plain tap, left to
+        // the click handler. Dragging into the cancel zone aborts the gesture.
+        // Events are not consumed yet, so the tap path stays intact.
+        var earlyUp = false
+        var gestureAborted = false
+        withTimeoutOrNull(HOLD_TO_RECORD_THRESHOLD_MS) {
+            while (true) {
+                val event = awaitPointerEvent()
+                val change =
+                    event.changes.firstOrNull { it.id == down.id }
+                        ?: run {
+                            gestureAborted = true
+                            return@withTimeoutOrNull
+                        }
+                if (!change.pressed) {
+                    earlyUp = true
+                    return@withTimeoutOrNull
+                }
+                if (change.isConsumed || slideAlpha(change.position) < CANCEL_RELEASE_ALPHA) {
+                    gestureAborted = true
+                    return@withTimeoutOrNull
+                }
+            }
+        }
+        if (gestureAborted) {
+            return@awaitEachGesture
+        }
+        if (earlyUp) {
+            return@awaitEachGesture
+        }
+
+        // Phase 2 — the threshold passed with the finger down: record until
+        // the finger lifts (send, unless dragged into the cancel zone), drags
+        // all the way left (cancel), or slides up (lock hands-free).
+        onHoldStart()
+        var send = false
+        var lock = false
+        try {
+            while (true) {
+                val event = awaitPointerEvent()
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                val alpha = slideAlpha(change.position)
+                onSlideProgress(alpha)
+                if (!change.pressed) {
+                    change.consume()
+                    send = alpha >= CANCEL_RELEASE_ALPHA
+                    break
+                }
+                if (change.isConsumed) {
+                    change.consume()
+                    break
+                }
+                if (alpha <= 0f) {
+                    change.consume()
+                    break
+                }
+                if (slidUp(change.position) && alpha >= LOCK_MIN_ALPHA) {
+                    lock = true
+                    change.consume()
+                    break
+                }
+                change.consume()
+            }
+        } finally {
+            onSlideProgress(1f)
+            when {
+                lock -> onHoldLock()
+                send -> onHoldEnd()
+                else -> onHoldCancel()
+            }
+        }
+    }
+}
+
+/** A press shorter than this is a tap; longer arms voice-note recording. */
+private const val HOLD_TO_RECORD_THRESHOLD_MS = 400L
+
+/** Sliding this far up from the mic button locks the recording hands-free. */
+private const val MIC_SLIDE_LOCK_DP = 57
+
+/** Full slide-to-cancel distance: a third of the composer (Telegram). */
+private const val MAX_CANCEL_DISTANCE_DP = 140
+
+/** Releasing below this drag fraction of the cancel distance cancels. */
+private const val CANCEL_RELEASE_ALPHA = 0.45f
+
+/** Locking only arms while the gesture stays clear of the cancel zone. */
+private const val LOCK_MIN_ALPHA = 0.7f

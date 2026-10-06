@@ -1,9 +1,8 @@
 package com.m57.hermescontrol.ui.chat.components
 
-import androidx.compose.runtime.getValue
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.text.input.rememberTextFieldState
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
@@ -11,12 +10,12 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
-import androidx.compose.ui.text.input.TextFieldValue
 import com.m57.hermescontrol.data.ws.CommandCatalog
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 
+@OptIn(ExperimentalFoundationApi::class)
 class ComposerReadinessTest {
     @get:Rule
     val compose = createComposeRule()
@@ -26,14 +25,14 @@ class ComposerReadinessTest {
         val ready = mutableStateOf(false)
         var sends = 0
         compose.setContent {
-            var input by remember { mutableStateOf(TextFieldValue("")) }
+            val input = rememberTextFieldState()
             ChatInputBar(
-                inputFieldValue = input,
-                onInputChange = { input = it },
+                inputState = input,
                 onSend = { sends++ },
                 onMicTap = {},
                 isListening = false,
                 isAgentTyping = true,
+                canInterrupt = ready.value,
                 isConnected = true,
                 commandCatalog = CommandCatalog(),
                 isSessionReady = ready.value,
@@ -42,14 +41,44 @@ class ComposerReadinessTest {
         compose.onNodeWithTag("chat_input").performTextInput("held draft")
         compose.onNodeWithTag("chat_input").assertTextEquals("held draft")
         compose.onNodeWithTag("chat_session_preparing").assertExists()
+        // Nothing to interrupt while the session prepares: the action button
+        // must not offer Stop (review, PR #1250).
+        compose.onNodeWithTag("stop_button").assertDoesNotExist()
         compose.onNodeWithTag("send_button").assertIsNotEnabled().performClick()
         compose.runOnIdle { assertEquals(0, sends) }
         compose.runOnIdle { ready.value = true }
         compose.onNodeWithTag("chat_session_preparing").assertDoesNotExist()
+        // Ready + typing = an interruptible generation: Send keeps the primary
+        // action slot and Stop moves to the flat slot beside it.
+        compose.onNodeWithTag("stop_button").assertExists()
         compose.onNodeWithTag("send_button").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, sends) }
         compose.runOnIdle { ready.value = false }
+        compose.onNodeWithTag("stop_button").assertDoesNotExist()
         compose.onNodeWithTag("send_button").assertIsNotEnabled()
         compose.onNodeWithTag("chat_input").assertTextEquals("held draft")
+    }
+
+    @Test
+    fun emptyDraftWhileStreamingMakesStopThePrimaryAction() {
+        compose.setContent {
+            val input = rememberTextFieldState()
+            ChatInputBar(
+                inputState = input,
+                onSend = {},
+                onMicTap = {},
+                isListening = false,
+                isAgentTyping = true,
+                canInterrupt = true,
+                isConnected = true,
+                commandCatalog = CommandCatalog(),
+                isSessionReady = true,
+            )
+        }
+        compose.onNodeWithTag("stop_button").assertExists()
+        compose.onNodeWithTag("send_button").assertDoesNotExist()
+        compose.onNodeWithTag("chat_input").performTextInput("next")
+        compose.onNodeWithTag("send_button").assertExists()
+        compose.onNodeWithTag("stop_button").assertExists()
     }
 }

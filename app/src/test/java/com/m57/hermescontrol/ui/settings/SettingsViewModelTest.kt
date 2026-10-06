@@ -2,6 +2,7 @@ package com.m57.hermescontrol.ui.settings
 
 import com.m57.hermescontrol.data.config.ConnectionProfile
 import com.m57.hermescontrol.data.local.AuthManager
+import com.m57.hermescontrol.data.model.BusySendMode
 import com.m57.hermescontrol.data.remote.ApiClient
 import com.m57.hermescontrol.data.session.ProfileSwitchCoordinator
 import com.m57.hermescontrol.theme.ThemePreference
@@ -47,6 +48,17 @@ class SettingsViewModelTest {
         return vm
     }
 
+    @Test
+    fun busySendDefaultLoadsAndSaves() {
+        every { AuthManager.getBusySendMode() } returns BusySendMode.GUIDE
+        val viewModel = createViewModel()
+        assertEquals(BusySendMode.GUIDE, viewModel.uiState.value.busySendMode)
+
+        viewModel.onBusySendModeChange(BusySendMode.QUEUE)
+        assertEquals(BusySendMode.QUEUE, viewModel.uiState.value.busySendMode)
+        verify(exactly = 1) { AuthManager.setBusySendMode(BusySendMode.QUEUE) }
+    }
+
     @Before
     fun setUp() {
         Dispatchers.setMain(testDispatcher)
@@ -71,14 +83,19 @@ class SettingsViewModelTest {
         every { AuthManager.isUseDynamicColors() } returns true
         every { AuthManager.getThemePreset() } returns ThemePreset.DEFAULT
         every { AuthManager.isTypingEffectEnabled() } returns true
+        every { AuthManager.getBusySendMode() } returns com.m57.hermescontrol.data.model.BusySendMode.CORRECT
+        every { AuthManager.setBusySendMode(any()) } returns Unit
         every { AuthManager.getTypingEffectDelayMs() } returns 30
         every { AuthManager.getChatFontScale() } returns 1.0f
+        every { AuthManager.getChatFontFamily() } returns "system"
         every { AuthManager.isMessageStatsEnabled() } returns false
         every { AuthManager.isUserMessageTokensEnabled() } returns true
         every { AuthManager.isAssistantMessageTokensEnabled() } returns true
         every { AuthManager.isTokensPerSecondEnabled() } returns true
         every { AuthManager.isModelProviderShown() } returns false
         every { AuthManager.isKeepConnectedInBackground() } returns false
+        every { AuthManager.isNotifySessionCompletions() } returns false
+        every { AuthManager.setNotifySessionCompletions(any()) } returns Unit
         every { AuthManager.getConnectionProfiles() } returns emptyList()
         every { AuthManager.getSelectedProfileId() } answers { storedSelectedProfileId }
         every { AuthManager.baseUrl() } returns "http://127.0.0.1:9119/"
@@ -91,6 +108,7 @@ class SettingsViewModelTest {
         every { AuthManager.setTypingEffectEnabled(any()) } returns Unit
         every { AuthManager.setTypingEffectDelayMs(any()) } returns Unit
         every { AuthManager.setChatFontScale(any()) } returns Unit
+        every { AuthManager.setChatFontFamily(any()) } returns Unit
         every { AuthManager.setMessageStatsEnabled(any()) } returns Unit
         every { AuthManager.setUserMessageTokensEnabled(any()) } returns Unit
         every { AuthManager.setAssistantMessageTokensEnabled(any()) } returns Unit

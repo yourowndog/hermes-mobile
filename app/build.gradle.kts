@@ -36,6 +36,16 @@ android {
     }
 
     signingConfigs {
+        getByName("debug") {
+            // Stable debug keystore committed to the repo so debug APKs keep
+            // the same signature across machines and CI runs. CI runners use
+            // an ephemeral default debug keystore otherwise, which makes every
+            // CI debug APK uninstallable over a previously installed build.
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
         create("release") {
             val isReleaseBuild =
                 gradle.startParameter.taskNames.any { name ->
@@ -77,18 +87,24 @@ android {
         debug {
             applicationIdSuffix = ".dev"
             versionNameSuffix = "-dev"
+
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
+
         release {
             isMinifyEnabled = true
             isShrinkResources = true
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             signingConfig = signingConfigs["release"]
             buildConfigField("boolean", "ALLOW_CLEARTEXT", "true")
             manifestPlaceholders["usesCleartextTraffic"] = "true"
         }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
         targetCompatibility = JavaVersion.VERSION_21
@@ -212,6 +228,7 @@ dependencies {
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.espresso.core)
     androidTestImplementation(libs.mockk.android)
+    androidTestImplementation(libs.okhttp.mockwebserver)
 
     // Navigation
     implementation(libs.androidx.navigation3.ui)
@@ -268,7 +285,8 @@ tasks.register("checkColorLiterals") {
     doLast {
         val offenders = mutableListOf<Pair<String, Int>>()
         srcDir.asFile.walkTopDown().filter { it.isFile && it.extension == "kt" }.forEach { file ->
-            if (exemptions.any { file.absolutePath.contains(it) }) return@forEach
+            // Issue #622: normalize Windows separators before checking path exemptions.
+            if (exemptions.any { file.invariantSeparatorsPath.contains(it) }) return@forEach
             file.useLines { lines ->
                 lines.forEachIndexed { idx, raw ->
                     val line = raw.trim()
@@ -301,6 +319,13 @@ tasks.named("check") {
     dependsOn("checkColorLiterals")
 }
 
-tasks.withType<Test> {
+val includeBenchmarks = providers.gradleProperty("includeBenchmarks").isPresent
+
+tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+    maxParallelForks = 2
+    // Assertion-free timing probes are opt-in: ./gradlew testDebugUnitTest -PincludeBenchmarks
+    if (!includeBenchmarks) {
+        filter { excludeTestsMatching("*Benchmark") }
+    }
 }

@@ -14,7 +14,7 @@ import java.io.File
 
 @Database(
     entities = [ChatMessageEntity::class],
-    version = 9,
+    version = 11,
     exportSchema = true,
 )
 abstract class HermesDatabase : RoomDatabase() {
@@ -115,6 +115,26 @@ abstract class HermesDatabase : RoomDatabase() {
                 }
             }
 
+        val MIGRATION_9_10: Migration =
+            object : Migration(9, 10) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    // v9 cannot prove whether a UUID-only row reached the server. Preserve that
+                    // ambiguity; only new outgoing prompts record LOCAL_PENDING before submit.
+                    connection.execSQL(
+                        "ALTER TABLE chat_messages ADD COLUMN message_provenance TEXT NOT NULL DEFAULT 'UNKNOWN'",
+                    )
+                }
+            }
+
+        val MIGRATION_10_11: Migration =
+            object : Migration(10, 11) {
+                override suspend fun migrate(connection: SQLiteConnection) {
+                    // Legacy placement is unknown: do not guess from timestamps or physical rowids.
+                    connection.execSQL("ALTER TABLE chat_messages ADD COLUMN local_anchor_order INTEGER")
+                    connection.execSQL("ALTER TABLE chat_messages ADD COLUMN local_predecessor_id TEXT")
+                }
+            }
+
         suspend fun get(context: Context): HermesDatabase =
             withContext(Dispatchers.IO) {
                 instance?.let { return@withContext it }
@@ -152,6 +172,8 @@ abstract class HermesDatabase : RoomDatabase() {
                             MIGRATION_6_7,
                             MIGRATION_7_8,
                             MIGRATION_8_9,
+                            MIGRATION_9_10,
+                            MIGRATION_10_11,
                         ).fallbackToDestructiveMigration(false)
                         .build()
                         .also { instance = it }

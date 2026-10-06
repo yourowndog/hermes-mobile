@@ -22,6 +22,32 @@ concurrency:
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────
+  # Job -1: PR template gate — runs alongside Detect Changes; a failure skips
+  # every expensive job (lint/tests/build) but not the cheap ones.
+  # Uses the base branch's copy of the script so a PR cannot weaken its own check.
+  # The explanatory bot comment is posted by pr-template.yml.
+  # ─────────────────────────────────────────────────────────────────────
+  pr-template:
+    name: PR Template
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout trusted script (base branch)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: Validate PR description
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/check_pr_template.py "$GITHUB_EVENT_PATH"
+
+  # ─────────────────────────────────────────────────────────────────────
   # Job 0: Detect changes — skips heavy Android build/tests for doc-only PRs
   # ─────────────────────────────────────────────────────────────────────
   changes:
@@ -56,8 +82,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ktlint:
     name: ktlint — Code Style
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -97,11 +123,8 @@ jobs:
       - name: Add local bin to PATH
         run: echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Run ktlintCheck
-        run: ./gradlew ktlintCheck
-
-      - name: Run checkColorLiterals (hardcoded Color guard, issue #622)
-        run: ./gradlew checkColorLiterals
+      - name: Run ktlintCheck + checkColorLiterals (hardcoded Color guard, issue #622)
+        run: ./gradlew ktlintCheck checkColorLiterals --continue
 
       - name: Upload ktlint reports
         if: always()
@@ -120,8 +143,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   android-lint:
     name: Android Lint — Static Analysis
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -159,8 +182,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   unit-tests:
     name: Unit & Integration Tests
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -185,6 +208,25 @@ jobs:
       - name: Run test
         run: ./gradlew test
 
+      # Telemetry only, never a gate: surfaces the slowest classes so perf work
+      # targets real offenders.
+      - name: Slowest unit-test classes
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          rows = []
+          for path in glob.glob("app/build/test-results/testDebugUnitTest/*.xml"):
+              root = ET.parse(path).getroot()
+              rows.append((float(root.get("time", 0)), int(root.get("tests", 0)), root.get("name", path)))
+          rows.sort(reverse=True)
+          print("### Slowest unit-test classes\n")
+          print(f"{len(rows)} classes, {sum(r[0] for r in rows):.0f}s summed across forks\n")
+          print("| Time | Tests | Class |\n|---:|---:|---|")
+          for secs, count, name in rows[:20]:
+              print(f"| {secs:.1f}s | {count} | `{name.rsplit('.', 1)[-1]}` |")
+          EOF
+
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v7
@@ -194,12 +236,12 @@ jobs:
           retention-days: 7
 
   # ─────────────────────────────────────────────────────────────────────
-  # Job 4: Build Debug APK — depends on all three above passing.
+  # Job 4: Build Debug APK — runs in parallel; CI Summary gates the result.
   # ─────────────────────────────────────────────────────────────────────
   build:
     name: Build Debug APK
-    needs: [changes, ktlint, android-lint, unit-tests]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -241,8 +283,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   release-compile:
     name: Release Compile Check
-    needs: [changes, ktlint, android-lint, unit-tests]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -274,8 +316,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   instrumented-tests:
     name: Instrumented Tests
-    needs: [changes]
-    if: needs.changes.outputs.code == 'true'
+    needs: [pr-template, changes]
+    if: ${{ !cancelled() && needs.pr-template.result != 'failure' && needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -339,7 +381,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-summary:
     name: CI Summary
-    needs: [changes, ktlint, android-lint, unit-tests, build, release-compile]
+    needs: [pr-template, changes, ktlint, android-lint, unit-tests, build, release-compile, instrumented-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     if: always()
@@ -350,16 +392,19 @@ jobs:
       - name: Check job results
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TEMPLATE_RESULT: ${{ needs.pr-template.result }}
           KTLINT_RESULT: ${{ needs.ktlint.result }}
           LINT_RESULT: ${{ needs.android-lint.result }}
           TEST_RESULT: ${{ needs.unit-tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           RELEASE_COMPILE_RESULT: ${{ needs.release-compile.result }}
+          INSTRUMENTED_RESULT: ${{ needs.instrumented-tests.result }}
         run: |
           LABEL="ci-red"
           FAILED=0
           FAILED_JOBS=""
-          for entry in "ktlint:$KTLINT_RESULT" "android-lint:$LINT_RESULT" "unit-tests:$TEST_RESULT" "build:$BUILD_RESULT" "release-compile:$RELEASE_COMPILE_RESULT"; do
+          for entry in "pr-template:$TEMPLATE_RESULT" "ktlint:$KTLINT_RESULT" "android-lint:$LINT_RESULT" "unit-tests:$TEST_RESULT" "build:$BUILD_RESULT" "release-compile:$RELEASE_COMPILE_RESULT" "instrumented-tests:$INSTRUMENTED_RESULT"; do
             name="${entry%%:*}"
             result="${entry#*:}"
             echo "::notice::$name = $result"
@@ -374,11 +419,11 @@ jobs:
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             PR=${{ github.event.pull_request.number }}
             if [[ "$FAILED" -eq 1 ]]; then
-              gh pr edit "$PR" --add-label "$LABEL" \
+              gh api -X POST "repos/$GH_REPO/issues/$PR/labels" -f "labels[]=$LABEL" --silent \
                 && echo "::notice::Added \"$LABEL\" to PR #$PR (failed: ${FAILED_JOBS% })"
             else
               # Fails if the label isn't present — that's fine, ignore it.
-              gh pr edit "$PR" --remove-label "$LABEL" 2>/dev/null || true
+              gh api -X DELETE "repos/$GH_REPO/issues/$PR/labels/$LABEL" --silent 2>/dev/null || true
             fi
           fi
 
