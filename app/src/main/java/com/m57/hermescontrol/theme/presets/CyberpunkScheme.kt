@@ -70,6 +70,7 @@ private val CyberpunkBg = Color(0xFF000A00) // background, primaryForeground, de
 private val CyberpunkFg = Color(0xFF00FF41) // foreground, primary, ring, midground
 private val CyberpunkCard = Color(0xFF001200) // card
 private val CyberpunkMuted = Color(0xFF001A00) // muted
+
 // Source mutedForeground #1A8A30 reaches only 4.11:1 on #001A00.
 // Lift the same green to preserve readable normal text under the 4.5:1 contract.
 private val CyberpunkMutedFg = Color(0xFF209539)
