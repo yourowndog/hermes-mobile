@@ -64,7 +64,9 @@ object ProfileSwitchCoordinator {
      * state before writing so startup never clobbers an explicit user switch.
      */
     suspend fun restoreActiveProfileScopeIfMissing(): String? {
-        AuthManager.activeProfileId.value?.takeIf { it.isNotBlank() }?.let { return it }
+        AuthManager.activeProfileId.value
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
 
         val result =
             withContext(ioDispatcher) {
