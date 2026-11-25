@@ -65,7 +65,7 @@ If Hermes Mobile is useful to you, consider supporting its development on [Ko-fi
 - **System Config:** Manage active profiles, installed skills, plugins, toolsets, and LLM model/provider selections.
 - **Operations:** Stream and filter live logs, manage cron jobs, edit environment keys, test webhooks, and monitor processes.
 - **Gateway Status:** Monitor WebSocket connection, MCP servers, messaging channels, and OAuth providers.
-- **Productivity:** View and manage tasks via integrated Kanban boards, track agent milestones, and browse session history.
+- **Productivity:** View and manage tasks via integrated Kanban boards, track agent milestones, and browse session history. Passive Kanban notices appear as a separate background notification while the app is connected; idle reception requires keep-connected mode. They do not enter the chat transcript or complete a pending reply.
 - **Analytics & Billing:** Usage analytics dashboard and billing/subscription management.
 - **Theming:** 6 built-in color presets (Default, Monochrome, Gruvbox, Catppuccin, AMOLED, Nord) plus Material You dynamic colors on supported devices.
 - **Modern UX:** Native Material 3 design with pull-to-refresh, scroll-aware TopBar, and customizable bottom navigation.
