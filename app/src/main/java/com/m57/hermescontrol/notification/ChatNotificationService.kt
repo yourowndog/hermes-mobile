@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -145,6 +146,14 @@ class ChatNotificationService : Service() {
                                         BackgroundConnectionController.default.onReplyCompleted(generation)
                                     }
 
+                                    is WsEvent.NotificationShow -> {
+                                        // Operational notices do not complete a pending reply,
+                                        // enter chat history, or offer a misleading reply action.
+                                        if (event.key?.startsWith("kanban:") == true && event.text.isNotBlank()) {
+                                            showOperationalNotification(event.text)
+                                        }
+                                    }
+
                                     is WsEvent.ClarifyRequest -> {
                                         showReplyNotification(getString(R.string.notif_clarification_needed), null)
                                     }
@@ -210,6 +219,23 @@ class ChatNotificationService : Service() {
         }
     }
 
+    private fun showOperationalNotification(text: String) {
+        val notification =
+            NotificationCompat
+                .Builder(this, CHAT_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(getString(R.string.notif_title))
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+                .setAutoCancel(true)
+                .setContentIntent(buildNotificationContentIntent(this, null, operational = true))
+                .build()
+        // Separate identity preserves existing reply notifications and their read tracking.
+        getSystemService(NotificationManager::class.java).notify("kanban", 3, notification)
+    }
+
     private fun showReplyNotification(
         text: String,
         sessionId: String?,
@@ -227,7 +253,7 @@ class ChatNotificationService : Service() {
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
                 .setAutoCancel(true)
-                .setContentIntent(buildContentIntent(sessionId))
+                .setContentIntent(buildNotificationContentIntent(this, sessionId))
 
         var replyGeneration: Long? = null
         if (isReplyMessage && !sessionId.isNullOrBlank() && !completionId.isNullOrBlank()) {
@@ -315,25 +341,6 @@ class ChatNotificationService : Service() {
                 notification = notification,
             )
         }
-    }
-
-    private fun buildContentIntent(sessionId: String?): PendingIntent {
-        val intent =
-            Intent(this, MainActivity::class.java).apply {
-                action = MainActivity.ACTION_OPEN_CHAT_FROM_NOTIFICATION
-                component = android.content.ComponentName(this@ChatNotificationService, MainActivity::class.java)
-                setPackage(packageName)
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                if (!sessionId.isNullOrBlank()) {
-                    putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
-                }
-            }
-        return PendingIntent.getActivity(
-            this,
-            sessionId?.hashCode() ?: 0,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT,
-        )
     }
 
     private fun buildForegroundNotification(text: String): Notification =
@@ -474,4 +481,32 @@ object NotificationHelper {
     }
 
     fun isAppInForeground(): Boolean = ChatNotificationService.isAppInForeground()
+}
+
+/** Operational notices must not share a one-shot token with chat/action notices. */
+internal fun buildNotificationContentIntent(
+    context: Context,
+    sessionId: String?,
+    operational: Boolean = false,
+): PendingIntent {
+    val intent =
+        Intent(context, MainActivity::class.java).apply {
+            action = MainActivity.ACTION_OPEN_CHAT_FROM_NOTIFICATION
+            component = android.content.ComponentName(context, MainActivity::class.java)
+            setPackage(context.packageName)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            if (operational) {
+                // Intent data participates in PendingIntent identity; extras do not.
+                data = Uri.parse("hermes-mobile://kanban-notice")
+            }
+            if (!sessionId.isNullOrBlank()) {
+                putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
+            }
+        }
+    return PendingIntent.getActivity(
+        context,
+        sessionId?.hashCode() ?: 0,
+        intent,
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_ONE_SHOT,
+    )
 }

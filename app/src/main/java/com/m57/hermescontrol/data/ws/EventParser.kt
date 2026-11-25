@@ -276,6 +276,13 @@ object EventParser {
                 WsEvent.ServerRequestCancelled(requestId, requestMethod, reason, sessionId)
             }
 
+            "notification.show" -> {
+                WsEvent.NotificationShow(
+                    text = payload?.get("text") as? String ?: "",
+                    key = payload?.get("key") as? String,
+                )
+            }
+
             "status.update" -> {
                 val status = payload?.get("status") as? String
                 WsEvent.StatusUpdate(status, payload)
